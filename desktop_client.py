@@ -772,6 +772,15 @@ class DesktopClient(tk.Tk):
         self.scheduler_notice_var = tk.StringVar(value="调度状态检查中")
         self.scheduler_notice = tk.Label(view, textvariable=self.scheduler_notice_var, bg="#eff9f3", fg=COLORS["green_dark"], anchor="w", padx=13, pady=8, font=(FONT, 9))
         self.scheduler_notice.pack(fill="x", pady=(0, 13))
+        controls = tk.Frame(view, bg=COLORS["bg"])
+        controls.pack(fill="x", pady=(0, 10))
+        tk.Button(controls, text="查看日志", command=self.open_selected_log, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["green_dark"], font=(FONT, 9, "bold"), padx=12, pady=7).pack(side="left")
+        tk.Button(controls, text="编辑选中任务", command=self.edit_selected_experiment, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["green_dark"], font=(FONT, 9), padx=12, pady=7).pack(side="left", padx=8)
+        tk.Button(controls, text="重新等待选中任务", command=self.retry_selected, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["green_dark"], font=(FONT, 9), padx=12, pady=7).pack(side="left", padx=8)
+        tk.Button(controls, text="暂停 / 继续任务", command=self.toggle_selected_pause, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["green_dark"], font=(FONT, 9), padx=12, pady=7).pack(side="left")
+        tk.Button(controls, text="暂停全部任务", command=self.pause_all_tasks, relief="flat", bd=0, bg="#fff5e8", fg=COLORS["amber"], font=(FONT, 9), padx=12, pady=7).pack(side="left", padx=8)
+        tk.Button(controls, text="全部重新等待", command=self.resume_all_tasks, relief="flat", bd=0, bg=COLORS["mint"], fg=COLORS["green_dark"], font=(FONT, 9), padx=12, pady=7).pack(side="left")
+        tk.Button(controls, text="停止选中任务", command=self.cancel_selected, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["red"], font=(FONT, 9), padx=12, pady=7).pack(side="left", padx=(8, 0))
         table_card = self._card(view)
         table_card.pack(fill="both", expand=True)
         toolbar = tk.Frame(table_card, bg=COLORS["surface"])
@@ -801,14 +810,6 @@ class DesktopClient(tk.Tk):
         scroll.pack(side="right", fill="y")
         self.queue_tree.configure(yscrollcommand=scroll.set)
         self.queue_tree.bind("<Double-1>", lambda _event: self.open_selected_log())
-        controls = tk.Frame(view, bg=COLORS["bg"])
-        controls.pack(fill="x", pady=(12, 0))
-        tk.Button(controls, text="查看日志", command=self.open_selected_log, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["green_dark"], font=(FONT, 9, "bold"), padx=12, pady=7).pack(side="left")
-        tk.Button(controls, text="重试选中任务", command=self.retry_selected, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["green_dark"], font=(FONT, 9), padx=12, pady=7).pack(side="left", padx=8)
-        tk.Button(controls, text="暂停 / 继续任务", command=self.toggle_selected_pause, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["green_dark"], font=(FONT, 9), padx=12, pady=7).pack(side="left")
-        tk.Button(controls, text="暂停全部任务", command=self.pause_all_tasks, relief="flat", bd=0, bg="#fff5e8", fg=COLORS["amber"], font=(FONT, 9), padx=12, pady=7).pack(side="left", padx=8)
-        tk.Button(controls, text="全部重新等待", command=self.resume_all_tasks, relief="flat", bd=0, bg=COLORS["mint"], fg=COLORS["green_dark"], font=(FONT, 9), padx=12, pady=7).pack(side="left")
-        tk.Button(controls, text="停止选中任务", command=self.cancel_selected, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["red"], font=(FONT, 9), padx=12, pady=7).pack(side="left")
 
     def _build_benchmarks(self) -> None:
         view = self._new_view("benchmarks")
@@ -1914,31 +1915,49 @@ class DesktopClient(tk.Tk):
         self.refresh_state()
         self.set_status("已断开服务器连接")
 
-    def open_experiment_dialog(self) -> None:
+    def open_experiment_dialog(self, experiment: dict[str, Any] | None = None) -> None:
+        editing = experiment is not None
+        if editing:
+            with self.manager.store.lock:
+                stored = next((item for item in self.manager.store.data.get("experiments", []) if item.get("id") == experiment.get("id")), None)
+                experiment = dict(stored) if stored else None
+            if not experiment:
+                self.set_status("实验不存在", True)
+                return
+            if experiment.get("status") == "running" or experiment.get("paused_process"):
+                self.set_status("执行中的任务请先暂停或停止后再编辑", True)
+                return
         dialog = tk.Toplevel(self)
-        dialog.title("提交一个实验")
+        dialog.title("编辑实验任务" if editing else "提交一个实验")
         dialog.configure(bg=COLORS["surface"])
         dialog.transient(self)
         dialog.grab_set()
         dialog.resizable(False, False)
         prefs = self.state.get("preferences") or {}
         profile = self.state.get("profile") or {}
-        tk.Label(dialog, text="NEW EXPERIMENT", bg=COLORS["surface"], fg="#84a49a", font=(MONO, 8)).grid(row=0, column=0, columnspan=2, sticky="w", padx=25, pady=(22, 0))
-        tk.Label(dialog, text="提交一个实验", bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 19, "bold")).grid(row=1, column=0, columnspan=2, sticky="w", padx=25, pady=(5, 4))
-        tk.Label(dialog, text="选择脚本、工作目录和运行环境；相同配置会成为下次默认值。", bg=COLORS["surface"], fg="#7d8d85", font=(FONT, 9)).grid(row=2, column=0, columnspan=2, sticky="w", padx=25, pady=(0, 18))
-        path_var = tk.StringVar()
-        name_var = tk.StringVar()
-        workdir_var = tk.StringVar(value=prefs.get("workdir") or profile.get("home") or "")
-        envs = (self.state.get("conda") or {}).get("envs") or []
-        env_var = tk.StringVar(value=prefs.get("conda_env") or "默认 Python")
-        priority_var = tk.StringVar(value="50")
-        level_var = tk.StringVar(value="idle_only")
-        memory_var = tk.StringVar(value=str(prefs.get("peak_memory_mb") or ""))
-        auto_var = tk.BooleanVar(value=True)
+        tk.Label(dialog, text="EDIT EXPERIMENT" if editing else "NEW EXPERIMENT", bg=COLORS["surface"], fg="#84a49a", font=(MONO, 8)).grid(row=0, column=0, columnspan=2, sticky="w", padx=25, pady=(22, 0))
+        tk.Label(dialog, text="编辑实验任务" if editing else "提交一个实验", bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 19, "bold")).grid(row=1, column=0, columnspan=2, sticky="w", padx=25, pady=(5, 4))
+        tk.Label(dialog, text="修改配置后重新进入等待队列；运行中的任务需要先暂停或停止。" if editing else "选择脚本、工作目录和运行环境；相同配置会成为下次默认值。", bg=COLORS["surface"], fg="#7d8d85", font=(FONT, 9)).grid(row=2, column=0, columnspan=2, sticky="w", padx=25, pady=(0, 18))
+        initial_script = str((experiment or {}).get("local_script") or "")
+        path_var = tk.StringVar(value=initial_script)
+        name_var = tk.StringVar(value=str((experiment or {}).get("name") or ""))
+        workdir_var = tk.StringVar(value=str((experiment or {}).get("workdir") if editing else (prefs.get("workdir") or profile.get("home") or "")))
+        initial_server_id = str((experiment or {}).get("server_id") or self.state.get("active_server_id") or "default")
+        initial_state = self.state.get("server_states", {}).get(initial_server_id) or (self.state if initial_server_id == self.state.get("active_server_id") else {})
+        envs = list((initial_state.get("conda") or {}).get("envs") or [])
+        initial_env = str((experiment or {}).get("conda_env") if editing else (prefs.get("conda_env") or ""))
+        env_var = tk.StringVar(value=initial_env or "默认 Python")
+        if initial_env and initial_env not in envs:
+            envs.insert(0, initial_env)
+        priority_var = tk.StringVar(value=str((experiment or {}).get("priority") if editing else 50))
+        level_var = tk.StringVar(value=str((experiment or {}).get("execution_level") if editing else "idle_only"))
+        memory_var = tk.StringVar(value=str((experiment or {}).get("peak_memory_mb") if editing else (prefs.get("peak_memory_mb") or "")))
+        auto_var = tk.BooleanVar(value=bool((experiment or {}).get("auto_retry_oom", True)))
         server_options = [f"{item.get('name') or item.get('host') or item.get('id')} · {item.get('host') or '未配置'}" for item in self.state.get("servers", [])]
         server_ids = [str(item.get("id")) for item in self.state.get("servers", [])]
         active_server_id = str(self.state.get("active_server_id") or "default")
-        server_var = tk.StringVar(value=server_options[server_ids.index(active_server_id)] if active_server_id in server_ids else (server_options[0] if server_options else ""))
+        selected_server_id = initial_server_id if editing else active_server_id
+        server_var = tk.StringVar(value=server_options[server_ids.index(selected_server_id)] if selected_server_id in server_ids else (server_options[0] if server_options else ""))
 
         def row_label(row: int, text: str) -> None:
             tk.Label(dialog, text=text, bg=COLORS["surface"], fg="#65746c", font=(FONT, 9, "bold")).grid(row=row, column=0, sticky="w", padx=25, pady=(0, 5))
@@ -1946,13 +1965,14 @@ class DesktopClient(tk.Tk):
         row_label(3, "实验名称")
         self._entry(dialog, textvariable=name_var, width=35).grid(row=3, column=1, padx=(10, 25), pady=(0, 10))
         row_label(4, "目标服务器")
-        server_combo = ttk.Combobox(dialog, textvariable=server_var, state="readonly", values=server_options, width=32)
+        server_combo = ttk.Combobox(dialog, textvariable=server_var, state="disabled" if editing else "readonly", values=server_options, width=32)
         server_combo.grid(row=4, column=1, padx=(10, 25), pady=(0, 10))
         row_label(5, "选择 .sh 文件")
         file_frame = tk.Frame(dialog, bg=COLORS["surface"])
         file_frame.grid(row=5, column=1, sticky="ew", padx=(10, 25), pady=(0, 10))
         tk.Button(file_frame, text="选择文件…", command=lambda: self.choose_script(path_var, path_label), relief="flat", bd=0, bg=COLORS["mint"], fg=COLORS["green_dark"], font=(FONT, 9, "bold"), padx=8, pady=5).pack(side="left")
-        path_label = tk.Label(file_frame, text="尚未选择", bg=COLORS["surface"], fg="#8d9993", font=(FONT, 8), width=25, anchor="w")
+        initial_script_label = Path(initial_script).name if initial_script else "尚未选择"
+        path_label = tk.Label(file_frame, text=initial_script_label, bg=COLORS["surface"], fg="#8d9993", font=(FONT, 8), width=25, anchor="w")
         path_label.pack(side="left", padx=8)
         row_label(6, "服务器工作目录")
         self._entry(dialog, textvariable=workdir_var, width=35).grid(row=6, column=1, padx=(10, 25), pady=(0, 10))
@@ -1965,14 +1985,19 @@ class DesktopClient(tk.Tk):
             selected_state = self.state.get("server_states", {}).get(selected_id, {})
             selected_profile = selected_state.get("profile") or {}
             selected_prefs = selected_state.get("preferences") or {}
-            workdir_var.set(selected_prefs.get("workdir") or selected_profile.get("home") or "")
             selected_envs = (selected_state.get("conda") or {}).get("envs") or []
-            env_combo.configure(values=["默认 Python"] + selected_envs)
-            selected_env = selected_prefs.get("conda_env") or "默认 Python"
-            env_var.set(selected_env if selected_env in selected_envs else "默认 Python")
-            memory_var.set(str(selected_prefs.get("peak_memory_mb") or ""))
-            selected_level = selected_prefs.get("execution_level") or "idle_only"
-            level_var.set(selected_level if selected_level in ("idle_only", "emergency") else "idle_only")
+            current_env = env_var.get() if editing and selected_id == initial_server_id else ""
+            env_values = list(selected_envs)
+            if current_env and current_env != "默认 Python" and current_env not in env_values:
+                env_values.insert(0, current_env)
+            env_combo.configure(values=["默认 Python"] + env_values)
+            if not editing or selected_id != initial_server_id:
+                workdir_var.set(selected_prefs.get("workdir") or selected_profile.get("home") or "")
+                selected_env = selected_prefs.get("conda_env") or "默认 Python"
+                env_var.set(selected_env if selected_env in env_values else "默认 Python")
+                memory_var.set(str(selected_prefs.get("peak_memory_mb") or ""))
+                selected_level = selected_prefs.get("execution_level") or "idle_only"
+                level_var.set(selected_level if selected_level in ("idle_only", "emergency") else "idle_only")
 
         server_combo.bind("<<ComboboxSelected>>", apply_server_defaults)
         apply_server_defaults()
@@ -1989,7 +2014,7 @@ class DesktopClient(tk.Tk):
         buttons = tk.Frame(dialog, bg=COLORS["surface"])
         buttons.grid(row=13, column=0, columnspan=2, sticky="e", padx=25, pady=18)
         tk.Button(buttons, text="取消", command=dialog.destroy, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["muted"], font=(FONT, 9), padx=10, pady=7).pack(side="left", padx=5)
-        submit = tk.Button(buttons, text="加入队列  →", relief="flat", bd=0, bg=COLORS["green"], fg="#ffffff", font=(FONT, 9, "bold"), padx=13, pady=7)
+        submit = tk.Button(buttons, text="保存并重新等待  →" if editing else "加入队列  →", relief="flat", bd=0, bg=COLORS["green"], fg="#ffffff", font=(FONT, 9, "bold"), padx=13, pady=7)
         submit.pack(side="left", padx=5)
 
         def submit_experiment() -> None:
@@ -2002,9 +2027,12 @@ class DesktopClient(tk.Tk):
             env = "" if env_var.get() == "默认 Python" else env_var.get()
             selected_server_id = server_ids[server_options.index(server_var.get())] if server_var.get() in server_options else active_server_id
             try:
-                self.add_experiment(selected_server_id, name, script, workdir_var.get().strip(), env, safe_int(priority_var.get(), 50), level, max(0, safe_int(memory_var.get(), 0)), auto_var.get())
+                if editing:
+                    self.update_experiment(experiment["id"], name, script, workdir_var.get().strip(), env, safe_int(priority_var.get(), 50), level, max(0, safe_int(memory_var.get(), 0)), auto_var.get())
+                else:
+                    self.add_experiment(selected_server_id, name, script, workdir_var.get().strip(), env, safe_int(priority_var.get(), 50), level, max(0, safe_int(memory_var.get(), 0)), auto_var.get())
                 dialog.destroy()
-                self.set_status("实验已加入队列")
+                self.set_status("实验配置已更新并重新进入等待队列" if editing else "实验已加入队列")
             except Exception as exc:
                 messagebox.showerror("提交失败", str(exc), parent=dialog)
 
@@ -2015,6 +2043,73 @@ class DesktopClient(tk.Tk):
         if path:
             variable.set(path)
             label.configure(text=Path(path).name)
+
+    def update_experiment(self, exp_id: str, name: str, script: str, workdir: str, env: str, priority: int, level: str, peak: int, auto_retry: bool) -> None:
+        with self.manager.store.lock:
+            stored = next((item for item in self.manager.store.data.get("experiments", []) if item.get("id") == exp_id), None)
+            if stored is None:
+                raise ValueError("实验不存在")
+            if stored.get("status") == "running" or stored.get("paused_process"):
+                raise ValueError("执行中的任务需要先暂停或停止")
+            server_id = str(stored.get("server_id") or "default")
+        target_runtime = self.manager.runtime_for(server_id)
+        if not script or not Path(script).is_file():
+            raise ValueError("请选择仍然存在的本地 .sh 文件")
+        script_path = Path(script)
+        local_script = Path(stored.get("local_script") or (UPLOAD_DIR / f"{exp_id}.sh"))
+        local_script.parent.mkdir(parents=True, exist_ok=True)
+        # 编辑任务时，文件选择框通常已经指向任务缓存中的原文件。
+        # Windows 对同一文件执行 copy2 会抛出 SameFileError，因此相同路径时直接复用。
+        try:
+            same_script = script_path.resolve() == local_script.resolve()
+        except OSError:
+            same_script = False
+        if not same_script:
+            shutil.copy2(script_path, local_script)
+        with self.manager.store.lock:
+            stored = next((item for item in self.manager.store.data.get("experiments", []) if item.get("id") == exp_id), None)
+            if stored is None:
+                raise ValueError("实验不存在")
+            data = self.manager.store.data
+            record = next((item for item in data.setdefault("servers", []) if item.get("id") == server_id), None)
+            disk_guard = target_runtime.disk_guard or {}
+            if record and record.get("scheduler_paused"):
+                new_status = "paused"
+                pause_reason = record.get("scheduler_pause_reason") or "该服务器调度已暂停"
+            elif disk_guard.get("blocked"):
+                new_status = "paused"
+                pause_reason = disk_guard.get("message") or "磁盘可用空间不足，已暂停调度"
+            else:
+                new_status = "queued"
+                pause_reason = ""
+            stored.update({
+                "name": name,
+                "script_name": Path(script).name,
+                "local_script": str(local_script),
+                "workdir": workdir,
+                "conda_env": env,
+                "priority": max(1, min(999, priority)),
+                "execution_level": level,
+                "peak_memory_mb": max(0, peak),
+                "auto_peak_memory_mb": 0,
+                "auto_retry_oom": auto_retry,
+                "status": new_status,
+                "pause_reason": pause_reason,
+                "paused_process": False,
+                "failure_reason": "",
+                "validation_error": "",
+                "finished_at": "",
+                "exit_code": None,
+                "assigned_gpu": None,
+                "pid": 0,
+                "process_group_id": 0,
+            })
+            if record is not None:
+                record.setdefault("preferences", {}).update({"workdir": workdir, "conda_env": env, "peak_memory_mb": max(0, peak), "execution_level": level})
+            data.setdefault("preferences", {}).update({"workdir": workdir, "conda_env": env, "peak_memory_mb": max(0, peak), "execution_level": level})
+            self.manager.store.save()
+        if target_runtime.connected and new_status == "queued":
+            self._tick_in_background()
 
     def add_experiment(self, server_id: str, name: str, script: str, workdir: str, env: str, priority: int, level: str, peak: int, auto_retry: bool) -> None:
         UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -2073,6 +2168,16 @@ class DesktopClient(tk.Tk):
         if not selection:
             return None
         return next((item for item in self.state.get("experiments", []) if item.get("id") == selection[0]), None)
+
+    def edit_selected_experiment(self) -> None:
+        item = self._selected_item()
+        if not item:
+            self.set_status("请先选择一个实验任务", True)
+            return
+        if item.get("status") == "running" or item.get("paused_process"):
+            self.set_status("执行中的任务请先暂停或停止后再编辑", True)
+            return
+        self.open_experiment_dialog(item)
 
     def retry_selected(self) -> None:
         item = self._selected_item()
