@@ -1,0 +1,4 @@
+Flask>=2.0,<4
+paramiko>=3.4,<4
+keyring>=25,<26
+
