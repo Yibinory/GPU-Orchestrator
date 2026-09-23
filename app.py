@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import fnmatch
+import glob
 import hashlib
 import json
 import os
@@ -82,6 +84,120 @@ def detect_oom(log_text: str, exit_code: int | None) -> bool:
     return any(pattern in text for pattern in patterns) or exit_code in (137, 139)
 
 
+SSH_CONFIG_FILE = Path.home() / ".ssh" / "config"
+SSH_CONFIG_MAX_INCLUDE_DEPTH = 3
+SSH_CONFIG_MAX_HOSTS = 50
+SSH_CONFIG_FIELDS = {"hostname": "hostname", "user": "user", "port": "port", "identityfile": "identity_file"}
+
+
+def _ssh_host_matches(patterns: list[str], alias: str) -> bool:
+    matched = False
+    for pattern in patterns:
+        negated = pattern.startswith("!")
+        candidate = pattern[1:] if negated else pattern
+        if fnmatch.fnmatchcase(alias, candidate):
+            if negated:
+                return False
+            matched = True
+    return matched
+
+
+def _read_ssh_config_blocks(path: Path, depth: int, seen: set[str]) -> list[tuple[list[str], dict[str, str]]]:
+    """Read Host blocks from one ssh config file, splicing in Include files.
+
+    Match blocks are not evaluated; their directives are ignored until the
+    next Host. Like ssh, the first obtained value for a parameter wins.
+    """
+    blocks: list[tuple[list[str], dict[str, str]]] = []
+    patterns: list[str] = []
+    params: dict[str, str] = {}
+
+    def flush() -> None:
+        nonlocal patterns, params
+        if patterns:
+            blocks.append((patterns, params))
+        patterns, params = [], {}
+
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return blocks
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        keyword = parts[0].lower()
+        value = parts[1].strip() if len(parts) > 1 else ""
+        if keyword == "host":
+            flush()
+            patterns = value.split()
+        elif keyword == "match":
+            flush()
+        elif keyword == "include":
+            flush()
+            if depth >= SSH_CONFIG_MAX_INCLUDE_DEPTH:
+                continue
+            for token in value.split():
+                token = str(Path(token).expanduser()) if token.startswith("~") else token
+                candidate = Path(token) if Path(token).is_absolute() else path.parent / token
+                for match in sorted(glob.glob(str(candidate))):
+                    include_path = Path(match)
+                    if not include_path.is_file():
+                        continue
+                    key = str(include_path.resolve())
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    blocks.extend(_read_ssh_config_blocks(include_path, depth + 1, seen))
+        elif patterns and keyword in SSH_CONFIG_FIELDS:
+            field = SSH_CONFIG_FIELDS[keyword]
+            if field not in params and value:
+                params[field] = value if field == "identity_file" else value.split()[0]
+    flush()
+    return blocks
+
+
+def parse_ssh_config(path: Path | None = None) -> list[dict[str, Any]]:
+    """Parse ~/.ssh/config into concrete host entries for quick import.
+
+    Wildcard aliases ("Host gpu*") are not importable targets but still
+    contribute default values to matching concrete aliases, matching ssh.
+    """
+    config_path = Path(path) if path is not None else SSH_CONFIG_FILE
+    if not config_path.is_file():
+        return []
+    blocks = _read_ssh_config_blocks(config_path, 0, {str(config_path.resolve())})
+    aliases: list[str] = []
+    for patterns, _params in blocks:
+        for pattern in patterns:
+            if pattern.startswith("!") or any(ch in pattern for ch in "*?"):
+                continue
+            if pattern not in aliases:
+                aliases.append(pattern)
+    result: list[dict[str, Any]] = []
+    for alias in aliases:
+        merged: dict[str, str] = {}
+        for patterns, params in blocks:
+            if not _ssh_host_matches(patterns, alias):
+                continue
+            for key, value in params.items():
+                merged.setdefault(key, value)
+        identity = merged.get("identity_file", "")
+        if identity.startswith("~"):
+            identity = str(Path(identity).expanduser())
+        result.append(
+            {
+                "alias": alias,
+                "hostname": merged.get("hostname") or alias,
+                "user": merged.get("user", ""),
+                "port": safe_int(merged.get("port"), 22),
+                "identity_file": identity,
+            }
+        )
+    return result[:SSH_CONFIG_MAX_HOSTS]
+
+
 class StateStore:
     def __init__(self, path: Path):
         self.path = path
@@ -151,16 +267,26 @@ class RemoteClient:
         host = str(profile.get("host", "")).strip()
         username = str(profile.get("username", "")).strip()
         port = safe_int(profile.get("port"), 22)
+        identity_file = str(profile.get("identity_file", "") or "").strip()
         if not host or not username:
             raise ValueError("服务器 IP 和账号不能为空")
+        key_path: Path | None = None
+        if identity_file:
+            key_path = Path(identity_file).expanduser()
+            if not key_path.is_file():
+                raise ValueError(f"找不到 SSH 私钥文件：{identity_file}")
         client = paramiko.SSHClient()
         # The first connection is deliberately convenient for a personal tool. The UI shows a warning.
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        # With a key, the password field doubles as the key passphrase; paramiko
+        # tries publickey first and falls back to password auth.
         client.connect(
             hostname=host,
             port=port,
             username=username,
-            password=password,
+            password=password or None,
+            key_filename=str(key_path) if key_path else None,
+            passphrase=password or None,
             timeout=15,
             banner_timeout=15,
             auth_timeout=15,
@@ -326,8 +452,8 @@ class Runtime:
         with self.lock:
             if not password:
                 password = self.saved_password(profile)
-            if not password:
-                raise ValueError("请输入密码；若已保存密码，请确认当前服务器配置一致")
+            if not password and not str(profile.get("identity_file", "") or "").strip():
+                raise ValueError("请输入密码或 SSH 私钥路径；若已保存密码，请确认当前服务器配置一致")
             home = self.remote.connect(profile, password)
             profile = {**profile, "home": home or profile.get("home", "")}
             record = self._server_record()
@@ -1625,7 +1751,7 @@ class RuntimeManager:
             profile = dict(record.get("profile") or {})
             if not profile.get("host") or not profile.get("username") or rt.connected:
                 continue
-            if not rt.saved_password(profile):
+            if not rt.saved_password(profile) and not str(profile.get("identity_file") or "").strip():
                 continue
 
             def worker(selected=server_id, selected_profile=profile, selected_runtime=rt) -> None:
@@ -1657,6 +1783,7 @@ def _profile_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "port": safe_int(payload.get("port"), 22),
         "username": str(payload.get("username", "")).strip(),
         "home": str(payload.get("home", "")).strip(),
+        "identity_file": str(payload.get("identity_file", "") or "").strip(),
         "poll_interval": max(2, min(60, safe_int(payload.get("poll_interval"), 5))),
     }
 
@@ -1673,6 +1800,23 @@ def index():
 @app.route("/api/state", methods=["GET"])
 def api_state():
     return jsonify(manager.public_state())
+
+
+@app.route("/api/ssh-config", methods=["GET"])
+def api_ssh_config():
+    try:
+        hosts = parse_ssh_config()
+    except Exception as exc:
+        return jsonify({"hosts": [], "path": str(SSH_CONFIG_FILE), "message": f"读取 SSH 配置失败：{exc}"})
+    if not hosts:
+        message = (
+            f"未找到 {SSH_CONFIG_FILE}"
+            if not SSH_CONFIG_FILE.is_file()
+            else "配置中没有可导入的具体主机"
+        )
+    else:
+        message = ""
+    return jsonify({"hosts": hosts, "path": str(SSH_CONFIG_FILE), "message": message})
 
 
 @app.route("/api/connect", methods=["POST"])

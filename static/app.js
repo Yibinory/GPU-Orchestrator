@@ -7,7 +7,8 @@ const UI = {
   queueFilter: 'all',
   selectedLog: null,
   editingExperimentId: null,
-  editingServerId: null
+  editingServerId: null,
+  sshHosts: []
 };
 
 const statusLabels = {
@@ -558,6 +559,9 @@ function openConnectionModal(serverId) {
   $('#connect-username').value = profile.username || '';
   $('#connect-interval').value = profile.poll_interval || 5;
   $('#connect-password').value = '';
+  $('#connect-identity').value = profile.identity_file || '';
+  $('#connect-sshconfig').value = '';
+  loadSshConfigOptions();
   setModal('connection-modal', true);
 }
 
@@ -574,6 +578,9 @@ function openServerModal(serverId) {
   $('#server-form-username').value = profile.username || '';
   $('#server-form-interval').value = profile.poll_interval || 5;
   $('#server-form-password').value = '';
+  $('#server-form-identity').value = profile.identity_file || '';
+  $('#server-form-sshconfig').value = '';
+  loadSshConfigOptions();
   $('#server-form-auto').checked = Boolean(record.auto_connect);
   $('#server-form-save').checked = true;
   $('#server-form-connect').checked = !serverId;
@@ -644,6 +651,43 @@ function renderCondaOptions(serverId, selected) {
   }).join('');
 }
 
+async function loadSshConfigOptions() {
+  let data;
+  try {
+    data = await api('/api/ssh-config');
+  } catch (error) {
+    data = { hosts: [], message: error.message };
+  }
+  UI.sshHosts = data.hosts || [];
+  ['#connect-sshconfig', '#server-form-sshconfig'].forEach(function (selector) {
+    const select = $(selector);
+    if (!select) return;
+    if (!UI.sshHosts.length) {
+      select.innerHTML = '<option value="">' + esc(data.message || '未找到可导入的主机') + '</option>';
+      select.disabled = true;
+      return;
+    }
+    select.disabled = false;
+    select.innerHTML = '<option value="">— 选择 ~/.ssh/config 中的主机 —</option>' + UI.sshHosts.map(function (host) {
+      const target = (host.user ? host.user + '@' : '') + host.hostname + ':' + host.port;
+      return '<option value="' + esc(host.alias) + '">' + esc(host.alias) + ' — ' + esc(target) + (host.identity_file ? ' 🔑' : '') + '</option>';
+    }).join('');
+  });
+}
+
+function fillFromSshHost(host, prefix) {
+  if (!host) return;
+  const set = function (id, value) {
+    const el = $('#' + id);
+    if (el) el.value = value;
+  };
+  if (prefix === 'server-form') set('server-form-name', host.alias);
+  set(prefix + '-host', host.hostname || host.alias);
+  set(prefix + '-port', host.port || 22);
+  set(prefix + '-username', host.user || '');
+  set(prefix + '-identity', host.identity_file || '');
+}
+
 /* ---------- data refresh ---------- */
 
 async function refresh() {
@@ -698,6 +742,16 @@ $('#experiment-server').addEventListener('change', function () {
   renderDependsOptions(serverId, UI.editingExperimentId, []);
 });
 
+$('#connect-sshconfig').addEventListener('change', function () {
+  const alias = $('#connect-sshconfig').value;
+  fillFromSshHost(UI.sshHosts.find(function (host) { return host.alias === alias; }), 'connect');
+});
+
+$('#server-form-sshconfig').addEventListener('change', function () {
+  const alias = $('#server-form-sshconfig').value;
+  fillFromSshHost(UI.sshHosts.find(function (host) { return host.alias === alias; }), 'server-form');
+});
+
 $('#connection-form').addEventListener('submit', async function (event) {
   event.preventDefault();
   const form = new FormData(event.currentTarget);
@@ -711,6 +765,7 @@ $('#connection-form').addEventListener('submit', async function (event) {
       port: form.get('port'),
       username: form.get('username'),
       password: form.get('password'),
+      identity_file: form.get('identity_file'),
       poll_interval: form.get('poll_interval'),
       save_password: $('#save-password').checked
     });
@@ -738,8 +793,9 @@ $('#server-form').addEventListener('submit', async function (event) {
       host: form.get('host'),
       port: form.get('port'),
       username: form.get('username'),
-      poll_interval: form.get('poll_interval'),
       password: form.get('password'),
+      identity_file: form.get('identity_file'),
+      poll_interval: form.get('poll_interval'),
       auto_connect: $('#server-form-auto').checked,
       save_password: $('#server-form-save').checked,
       connect_now: $('#server-form-connect').checked
