@@ -299,7 +299,10 @@ class RemoteClient:
         self.client = client
         self.sftp = client.open_sftp()
         self.profile = {**profile, "port": port}
-        home = self.exec('printf "%s" "$HOME"')["stdout"].strip()
+        # Login banners (MOTD) may precede the printf output on some hosts;
+        # the detected home is always the last non-empty line.
+        lines = [line.strip() for line in self.exec('printf "%s" "$HOME"')["stdout"].splitlines() if line.strip()]
+        home = lines[-1] if lines else ""
         if home:
             self.profile["home"] = home
         return home
