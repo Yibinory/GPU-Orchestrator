@@ -109,7 +109,7 @@ button { cursor: pointer; }
 .gpu-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
 .gpu-card { position: relative; padding: 20px; min-height: 233px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); }
 .gpu-card-top { display: flex; align-items: flex-start; justify-content: space-between; }
-.gpu-index { width: 33px; height: 33px; display: grid; place-items: center; border-radius: 9px; background: var(--mint); color: var(--green-dark); font: 700 12px 'DM Mono', monospace; }
+.gpu-index { display: inline-grid; place-items: center; min-width: 33px; height: 33px; padding: 0 10px; white-space: nowrap; border-radius: 9px; background: var(--mint); color: var(--green-dark); font: 700 12px 'DM Mono', monospace; }
 .gpu-name { max-width: calc(100% - 45px); margin: 1px 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 800; }
 .gpu-id { margin-top: 5px; color: #99a49f; font: 9px 'DM Mono', monospace; }
 .gpu-temp { color: #8c9893; font: 10px 'DM Mono', monospace; }
