@@ -13,7 +13,7 @@ from typing import Any
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from app import Runtime, UPLOAD_DIR, clean_name, now_iso, runtime as default_runtime, safe_int, store
+from app import Runtime, UPLOAD_DIR, clean_name, now_iso, runtime as default_runtime, safe_float, safe_int, store
 
 
 # A native Windows desktop shell around the SSH/runtime layer. It does not start Flask.
@@ -108,6 +108,13 @@ STATUS_LABELS = {
     "canceled": "已取消",
 }
 
+EXECUTION_LEVEL_LABELS = {
+    "idle_only": "默认执行 · 仅空闲 GPU",
+    "low_interference": "低干扰执行 · 忙卡低于利用率限制",
+    "emergency": "紧急执行 · 有足够显存即运行",
+}
+EXECUTION_LEVEL_KEYS = {label: key for key, label in EXECUTION_LEVEL_LABELS.items()}
+
 
 class DesktopRuntimeManager:
     """Owns one SSH/runtime worker per configured server."""
@@ -123,6 +130,12 @@ class DesktopRuntimeManager:
         data = self.store.data
         servers = data.setdefault("servers", [])
         changed = False
+        global_settings = data.setdefault("global_settings", {})
+        history_samples = max(1, min(120, safe_int(global_settings.get("gpu_history_samples"), 5)))
+        if global_settings.get("gpu_history_samples") != history_samples:
+            global_settings["gpu_history_samples"] = history_samples
+            changed = True
+        data.setdefault("gpu_history", {})
         default_record = next((item for item in servers if item.get("id") == "default"), None)
         if default_record is None:
             profile = dict(data.get("profile", {}))
@@ -142,6 +155,14 @@ class DesktopRuntimeManager:
             default_record["_auto_connect_configured"] = True
             changed = True
         for record in servers:
+            if "disk_alert_gb" not in record:
+                record["disk_alert_gb"] = 5
+                changed = True
+            else:
+                old_threshold = record.get("disk_alert_gb")
+                record["disk_alert_gb"] = max(0, safe_float(old_threshold, 5))
+                if old_threshold != record["disk_alert_gb"]:
+                    changed = True
             if "enabled" not in record:
                 record["enabled"] = True
                 changed = True
@@ -250,6 +271,7 @@ class DesktopRuntimeManager:
                 "scheduler_paused": bool(state.get("scheduler_paused")),
                 "scheduler_pause_reason": state.get("scheduler_pause_reason", ""),
                 "disk_blocked": bool((state.get("disk_guard") or {}).get("blocked")),
+                "disk_alert_gb": safe_float(record.get("disk_alert_gb"), 5),
             })
             server_states[server_id] = state
         active_state["experiments"] = self._visible_experiments()
@@ -257,6 +279,7 @@ class DesktopRuntimeManager:
         active_state["servers"] = servers
         active_state["server_states"] = server_states
         active_state["active_server_id"] = self.active_server_id
+        active_state["global_settings"] = dict(self.store.data.setdefault("global_settings", {}))
         active_record = next((item for item in self.store.data.get("servers", []) if item.get("id") == self.active_server_id), {})
         active_state["connected"] = bool(active_record.get("enabled", True) and active_state.get("connected", False))
         return active_state
@@ -283,6 +306,36 @@ class DesktopRuntimeManager:
         self.store.save()
         self._sync_runtimes()
         return server_id
+
+    def set_disk_alert_gb(self, server_id: str, threshold_gb: float) -> None:
+        with self.store.lock:
+            record = next((item for item in self.store.data.get("servers", []) if item.get("id") == server_id), None)
+            if record is None:
+                raise ValueError("服务器不存在")
+            record["disk_alert_gb"] = max(0, min(1_000_000, safe_float(threshold_gb, 5)))
+            self.store.save()
+        runtime = self.runtime_for(server_id)
+        with runtime.lock:
+            if runtime.connected and runtime.snapshot is not None:
+                runtime._update_disk_guard(runtime.snapshot)
+                if runtime.disk_guard.get("blocked"):
+                    runtime._pause_waiting_for_disk()
+            else:
+                runtime.disk_guard = {
+                    "blocked": False,
+                    "free_bytes": None,
+                    "threshold_bytes": int(record["disk_alert_gb"] * 1024**3),
+                    "message": "",
+                }
+
+    def set_gpu_history_samples(self, sample_count: int) -> None:
+        sample_count = max(1, min(120, safe_int(sample_count, 5)))
+        with self.store.lock:
+            self.store.data.setdefault("global_settings", {})["gpu_history_samples"] = sample_count
+            for server_history in self.store.data.setdefault("gpu_history", {}).values():
+                for history in server_history.values():
+                    del history[:-sample_count]
+            self.store.save()
 
     def remove_server(self, server_id: str) -> None:
         if server_id == "default":
@@ -473,7 +526,15 @@ class DesktopRuntimeManager:
         return self.runtime_for(server_id).run_benchmark(gpu_index, seconds=seconds, conda_env=conda_env)
 
     def read_log(self, experiment: dict[str, Any]) -> str:
-        return self.runtime_for(str(experiment.get("server_id") or "default"))._read_log(experiment)
+        log = self.runtime_for(str(experiment.get("server_id") or "default"))._read_log(experiment, max_bytes=24000)
+        return "".join(log.splitlines(keepends=True)[-200:])
+
+    def read_full_log(self, experiment: dict[str, Any]) -> str:
+        runtime = self.runtime_for(str(experiment.get("server_id") or "default"))
+        path = str(experiment.get("log_path") or "")
+        if not path:
+            return ""
+        return runtime.remote.read_text(path, tail=None)
 
 
 class DesktopClient(tk.Tk):
@@ -655,6 +716,7 @@ class DesktopClient(tk.Tk):
             ("queue", "实验队列", "≡"),
             ("benchmarks", "GPU 测试", "ϟ"),
             ("logs", "运行日志", "▤"),
+            ("settings", "全局设置", "⚙"),
         ):
             button = tk.Button(
                 self.sidebar,
@@ -704,6 +766,7 @@ class DesktopClient(tk.Tk):
         self._build_queue()
         self._build_benchmarks()
         self._build_logs()
+        self._build_settings()
         self.status_bar = tk.Label(self.main, textvariable=self.status_var, bg="#eaf1ed", fg="#6e8077", anchor="w", padx=12, pady=5, font=(FONT, 9))
         self.status_bar.pack(fill="x", side="bottom")
 
@@ -1003,11 +1066,33 @@ class DesktopClient(tk.Tk):
         self.log_title_var = tk.StringVar(value="选择一个任务")
         tk.Label(log_head, text="TAIL OUTPUT", bg=COLORS["surface"], fg="#84a49a", font=(MONO, 8)).pack(anchor="w")
         tk.Label(log_head, textvariable=self.log_title_var, bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 14, "bold")).pack(side="left", pady=(4, 0))
+        tk.Button(log_head, text="详情", command=self.open_full_log, relief="flat", bd=0, bg=COLORS["mint"], fg=COLORS["green_dark"], font=(FONT, 9, "bold"), padx=10, pady=5).pack(side="right", padx=(7, 0), pady=(3, 0))
         tk.Button(log_head, text="↻ 刷新", command=self.load_selected_log, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["green_dark"], font=(FONT, 9, "bold")).pack(side="right", pady=(5, 0))
+        tk.Label(self.log_view_card, text="自动刷新最近 200 行（最多读取 24 KB）；点击“详情”加载完整日志。", bg=COLORS["surface"], fg="#9aa59f", font=(FONT, 8)).pack(anchor="w", padx=18, pady=(0, 6))
         self.log_text = tk.Text(self.log_view_card, bg="#122c27", fg="#a6c8b7", insertbackground="#a6c8b7", relief="flat", bd=0, wrap="word", font=(MONO, 9), padx=18, pady=14)
         self.log_text.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self.log_text.insert("1.0", "选择左侧实验查看最新日志。")
         self.log_text.configure(state="disabled")
+
+    def _build_settings(self) -> None:
+        view = self._new_view("settings")
+        heading = tk.Frame(view, bg=COLORS["bg"])
+        heading.pack(fill="x", pady=(12, 20))
+        tk.Label(heading, text="GLOBAL SETTINGS", bg=COLORS["bg"], fg="#84a49a", font=(MONO, 8)).pack(anchor="w")
+        tk.Label(heading, text="全局设置", bg=COLORS["bg"], fg=COLORS["ink"], font=(FONT, 23, "bold")).pack(anchor="w", pady=(4, 0))
+        tk.Label(heading, text="调度采样基准适用于所有已连接服务器。", bg=COLORS["bg"], fg="#87938e", font=(FONT, 9)).pack(anchor="w", pady=(5, 0))
+        card = self._card(view)
+        card.pack(fill="x", anchor="n")
+        tk.Label(card, text="GPU 调度采样", bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 14, "bold")).pack(anchor="w", padx=20, pady=(18, 4))
+        tk.Label(card, text="判断忙卡是否能接收共享任务时，显存按最近采样中的峰值占用估算，GPU 利用率按最近采样中的最高值判断。空闲卡仍按当前状态判断。", bg=COLORS["surface"], fg="#78867f", font=(FONT, 9), wraplength=780, justify="left").pack(anchor="w", padx=20, pady=(0, 15))
+        row = tk.Frame(card, bg=COLORS["surface"])
+        row.pack(fill="x", padx=20, pady=(0, 18))
+        tk.Label(row, text="采样次数（1–120）", bg=COLORS["surface"], fg="#65746c", font=(FONT, 9, "bold")).pack(side="left")
+        self.gpu_history_samples_var = tk.StringVar(value="5")
+        self.gpu_history_samples_entry = self._spinbox(row, textvariable=self.gpu_history_samples_var, from_=1, to=120, width=7)
+        self.gpu_history_samples_entry.pack(side="left", padx=(12, 0))
+        tk.Label(row, text="次 / 每张 GPU", bg=COLORS["surface"], fg="#8b9892", font=(FONT, 9)).pack(side="left", padx=8)
+        tk.Button(row, text="保存设置", command=self.save_global_settings, relief="flat", bd=0, bg=COLORS["green"], fg="#ffffff", font=(FONT, 9, "bold"), padx=13, pady=7).pack(side="right")
 
     def _show_view(self, view: str) -> None:
         self.current_view = view
@@ -1021,6 +1106,7 @@ class DesktopClient(tk.Tk):
             "queue": ("EXPERIMENT QUEUE", "实验队列"),
             "benchmarks": ("TENSOR BENCHMARK", "GPU 测试"),
             "logs": ("RUN LOGS", "运行日志"),
+            "settings": ("GLOBAL SETTINGS", "全局设置"),
         }
         self.header_kicker.set(labels[view][0])
         self.header_title.set(labels[view][1])
@@ -1032,6 +1118,26 @@ class DesktopClient(tk.Tk):
             self.render_benchmarks()
         elif view == "logs":
             self.render_logs()
+        elif view == "settings":
+            self.render_settings()
+
+    def render_settings(self) -> None:
+        if not hasattr(self, "gpu_history_samples_var"):
+            return
+        settings = self.state.get("global_settings") or {}
+        self.gpu_history_samples_var.set(str(max(1, min(120, safe_int(settings.get("gpu_history_samples"), 5)))))
+
+    def save_global_settings(self) -> None:
+        try:
+            count = safe_int(self.gpu_history_samples_var.get(), 0)
+            if count < 1 or count > 120:
+                raise ValueError("采样次数需设置为 1 到 120")
+            self.manager.set_gpu_history_samples(count)
+            self.state = self.manager.public_state()
+            self.render_settings()
+            self.set_status(f"全局 GPU 采样基准已更新为最近 {count} 次")
+        except Exception as exc:
+            messagebox.showerror("设置未保存", str(exc), parent=self)
 
     def set_status(self, message: str, error: bool = False) -> None:
         self.status_var.set(message)
@@ -1573,7 +1679,7 @@ class DesktopClient(tk.Tk):
             if self.queue_filter == "all" or (self.queue_filter == "queued" and status in ("queued", "waiting_memory")) or (self.queue_filter == "failed" and status in ("failed", "canceled")) or status == self.queue_filter:
                 visible.append(item)
         visible.sort(key=lambda item: (safe_int(item.get("priority"), 50), safe_int(item.get("created_seq"), 0)))
-        signature = (self.queue_filter, tuple((item.get("id"), item.get("task_no"), item.get("server_id"), item.get("status"), item.get("priority"), item.get("execution_level"), (item.get("assigned_gpu") or {}).get("index"), item.get("peak_memory_mb"), item.get("failure_reason"), item.get("pause_reason"), item.get("dependency_reason"), tuple(item.get("depends_on") or [])) for item in visible))
+        signature = (self.queue_filter, tuple((item.get("id"), item.get("task_no"), item.get("server_id"), item.get("status"), item.get("priority"), item.get("execution_level"), item.get("max_gpu_utilization"), (item.get("assigned_gpu") or {}).get("index"), item.get("peak_memory_mb"), item.get("failure_reason"), item.get("pause_reason"), item.get("dependency_reason"), tuple(item.get("depends_on") or [])) for item in visible))
         if signature == self.queue_signature:
             return
         self.queue_signature = signature
@@ -1591,8 +1697,12 @@ class DesktopClient(tk.Tk):
                 strategy = "等待前序任务"
             elif item.get("depends_on"):
                 strategy = "前序完成 · " + "、".join(str(value)[:8] for value in item.get("depends_on")[:2])
+            elif item.get("execution_level") == "low_interference":
+                strategy = f"低干扰 · 利用率低于 {safe_int(item.get('max_gpu_utilization'), 30)}%"
+            elif item.get("execution_level") == "emergency":
+                strategy = "紧急 · 有显存即跑"
             else:
-                strategy = "紧急 · 有显存即跑" if item.get("execution_level") == "emergency" else "默认 · GPU 空闲"
+                strategy = "默认 · GPU 空闲"
             values = (f"{task_identifier(item)}  {item.get('name')}  ·  {item.get('script_name')}", server_name, STATUS_LABELS.get(item.get("status"), item.get("status")), f"P{item.get('priority')}", strategy, gpu, memory)
             if item_id in self.queue_tree.get_children():
                 self.queue_tree.item(item_id, values=values, tags=(item.get("status"),))
@@ -1829,25 +1939,85 @@ class DesktopClient(tk.Tk):
         if not item or not self.manager.runtime_for(str(item.get("server_id") or "default")).connected:
             return
         self.log_loading = True
+        selected_id = self.selected_log
 
         def worker() -> None:
             try:
                 log = self.manager.read_log(item)
-                self.after(0, lambda: self._set_log_text(log))
+                self.after(0, lambda: self._set_log_text(selected_id, log))
             except Exception as exc:
-                self.after(0, lambda: self._set_log_text(str(exc)))
+                self.after(0, lambda error=str(exc): self._set_log_text(selected_id, error))
             finally:
                 self.after(0, lambda: setattr(self, "log_loading", False))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _set_log_text(self, content: str) -> None:
-        self.log_title_var.set(next((item.get("name", "") for item in self.state.get("experiments", []) if item.get("id") == self.selected_log), ""))
+    def _set_log_text(self, exp_id: str, content: str) -> None:
+        if exp_id != self.selected_log:
+            return
+        self.log_title_var.set(next((item.get("name", "") for item in self.state.get("experiments", []) if item.get("id") == exp_id), ""))
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.insert("1.0", content or "暂无输出")
         self.log_text.configure(state="disabled")
         self.log_text.see("end")
+
+    def open_full_log(self) -> None:
+        if not self.selected_log:
+            self.set_status("请先选择一个实验任务", True)
+            return
+        item = next((exp for exp in self.state.get("experiments", []) if exp.get("id") == self.selected_log), None)
+        if not item:
+            self.set_status("实验任务不存在", True)
+            return
+        target_runtime = self.manager.runtime_for(str(item.get("server_id") or "default"))
+        if not target_runtime.connected:
+            messagebox.showinfo("完整日志", "请先连接该实验所在的服务器。", parent=self)
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title(f"完整日志 · {item.get('name') or task_identifier(item)}")
+        dialog.configure(bg=COLORS["bg"])
+        dialog.transient(self)
+        dialog.geometry("1000x720")
+        dialog.minsize(700, 450)
+        header = tk.Frame(dialog, bg=COLORS["bg"])
+        header.pack(fill="x", padx=18, pady=(16, 8))
+        tk.Label(header, text=f"完整日志 · {task_identifier(item)} {item.get('name') or ''}", bg=COLORS["bg"], fg=COLORS["ink"], font=(FONT, 13, "bold")).pack(side="left")
+        status_var = tk.StringVar(value="正在读取服务器上的完整日志…")
+        tk.Label(dialog, textvariable=status_var, bg=COLORS["bg"], fg=COLORS["muted"], font=(FONT, 8), anchor="w").pack(fill="x", padx=19, pady=(0, 7))
+        body = tk.Frame(dialog, bg="#122c27")
+        body.pack(fill="both", expand=True, padx=18, pady=(0, 16))
+        text_widget = tk.Text(body, bg="#122c27", fg="#a6c8b7", insertbackground="#a6c8b7", relief="flat", bd=0, wrap="none", font=(MONO, 9), padx=14, pady=12)
+        scrollbar = ttk.Scrollbar(body, orient="vertical", command=text_widget.yview)
+        horizontal = ttk.Scrollbar(body, orient="horizontal", command=text_widget.xview)
+        text_widget.configure(yscrollcommand=scrollbar.set, xscrollcommand=horizontal.set, state="disabled")
+        text_widget.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        horizontal.grid(row=1, column=0, sticky="ew")
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+
+        def worker() -> None:
+            try:
+                content = self.manager.read_full_log(item)
+                error = ""
+            except Exception as exc:
+                content = ""
+                error = str(exc)
+
+            def show_result() -> None:
+                if not dialog.winfo_exists():
+                    return
+                text_widget.configure(state="normal")
+                text_widget.delete("1.0", "end")
+                text_widget.insert("1.0", content or (error or "暂无输出"))
+                text_widget.configure(state="disabled")
+                text_widget.see("end")
+                status_var.set(error or f"已加载完整日志 · {len(content):,} 个字符")
+
+            self.after(0, show_result)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _tick_in_background(self) -> None:
         if not any(rt.connected for rt in self.manager.runtimes.values()):
@@ -1874,10 +2044,10 @@ class DesktopClient(tk.Tk):
         tk.Label(dialog, text="每条记录对应一个独立 SSH 连接；相同 IP 但不同端口、账号或连接用途可以分别保存。", bg=COLORS["bg"], fg="#87958e", font=(FONT, 9)).pack(anchor="w", padx=22, pady=(4, 14))
         table_frame = tk.Frame(dialog, bg=COLORS["surface"], highlightbackground=COLORS["line"], highlightthickness=1)
         table_frame.pack(fill="both", expand=True, padx=22, pady=(0, 13))
-        columns = ("name", "host", "status", "monitor", "auto")
+        columns = ("name", "host", "status", "disk", "monitor", "auto")
         tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse", height=6)
-        headings = {"name": "名称", "host": "连接地址", "status": "连接状态", "monitor": "监控", "auto": "启动时自动连接"}
-        widths = {"name": 140, "host": 190, "status": 105, "monitor": 75, "auto": 125}
+        headings = {"name": "名称", "host": "连接地址", "status": "连接状态", "disk": "磁盘告警", "monitor": "监控", "auto": "启动时自动连接"}
+        widths = {"name": 125, "host": 170, "status": 90, "disk": 85, "monitor": 60, "auto": 115}
         for column in columns:
             tree.heading(column, text=headings[column])
             tree.column(column, width=widths[column], anchor="w")
@@ -1893,7 +2063,8 @@ class DesktopClient(tk.Tk):
             for item in self.state.get("servers", []):
                 status = "已连接" if item.get("connected") else ("连接失败" if item.get("last_error") else "离线")
                 monitor = "启用" if item.get("enabled", True) else "已停用"
-                tree.insert("", "end", iid=str(item.get("id")), values=(item.get("name") or item.get("host"), f"{item.get('host')}:{item.get('port', 22)} · {item.get('username', '')}", status, monitor, "是" if item.get("auto_connect") else "否"))
+                threshold = safe_float(item.get("disk_alert_gb"), 5)
+                tree.insert("", "end", iid=str(item.get("id")), values=(item.get("name") or item.get("host"), f"{item.get('host')}:{item.get('port', 22)} · {item.get('username', '')}", status, f"{threshold:g} GB" if threshold else "关闭", monitor, "是" if item.get("auto_connect") else "否"))
             active_id = str(self.state.get("active_server_id") or "default")
             if tree.exists(active_id):
                 tree.selection_set(active_id)
@@ -1916,6 +2087,7 @@ class DesktopClient(tk.Tk):
         buttons.pack(fill="x", padx=22, pady=(0, 18))
         tk.Button(buttons, text="新建服务器", command=lambda: self.open_connection_dialog(new_server=True, parent=dialog, on_saved=refresh), relief="flat", bd=0, bg=COLORS["green"], fg="#ffffff", font=(FONT, 9, "bold"), padx=12, pady=7).pack(side="left")
         tk.Button(buttons, text="编辑", command=lambda: (self.open_connection_dialog(selected_id(), parent=dialog, on_saved=refresh) if selected_id() else self.set_status("请先选择服务器", True)), relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["green_dark"], font=(FONT, 9), padx=12, pady=7).pack(side="left", padx=7)
+        tk.Button(buttons, text="磁盘告警", command=lambda: (self.open_disk_alert_dialog(selected_id(), parent=dialog, on_saved=refresh) if selected_id() else self.set_status("请先选择服务器", True)), relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["green_dark"], font=(FONT, 9), padx=12, pady=7).pack(side="left")
 
         def toggle_monitoring() -> None:
             server_id = selected_id()
@@ -1950,6 +2122,48 @@ class DesktopClient(tk.Tk):
         tk.Button(buttons, text="删除", command=remove, relief="flat", bd=0, bg="#fff1ef", fg=COLORS["red"], font=(FONT, 9), padx=12, pady=7).pack(side="left")
         tk.Button(buttons, text="关闭", command=dialog.destroy, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["muted"], font=(FONT, 9), padx=12, pady=7).pack(side="right")
         refresh()
+
+    def open_disk_alert_dialog(self, server_id: str, parent: tk.Misc | None = None, on_saved: Any = None) -> None:
+        record = next((item for item in self.manager.store.data.get("servers", []) if item.get("id") == server_id), None)
+        if record is None:
+            self.set_status("服务器不存在", True)
+            return
+        dialog = tk.Toplevel(parent or self)
+        dialog.title("磁盘告警容量")
+        dialog.configure(bg=COLORS["surface"])
+        dialog.transient(parent or self)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        name = record.get("name") or record.get("profile", {}).get("host") or server_id
+        tk.Label(dialog, text="SERVER DISK ALERT", bg=COLORS["surface"], fg="#84a49a", font=(MONO, 8)).grid(row=0, column=0, columnspan=2, sticky="w", padx=24, pady=(20, 0))
+        tk.Label(dialog, text=f"{name} · 磁盘告警", bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 18, "bold")).grid(row=1, column=0, columnspan=2, sticky="w", padx=24, pady=(5, 4))
+        tk.Label(dialog, text="主目录可用空间低于此值时报警并暂停该服务器的任务调度。设为 0 可关闭磁盘告警。", bg=COLORS["surface"], fg="#7d8d85", font=(FONT, 9), wraplength=410, justify="left").grid(row=2, column=0, columnspan=2, sticky="w", padx=24, pady=(0, 16))
+        tk.Label(dialog, text="告警容量（GB）", bg=COLORS["surface"], fg="#65746c", font=(FONT, 9, "bold")).grid(row=3, column=0, sticky="w", padx=24, pady=(0, 8))
+        value = tk.StringVar(value=f"{safe_float(record.get('disk_alert_gb'), 5):g}")
+        entry = self._spinbox(dialog, textvariable=value, from_=0, to=1000000, increment=0.5, width=18)
+        entry.grid(row=3, column=1, sticky="ew", padx=(10, 24), pady=(0, 8))
+        buttons = tk.Frame(dialog, bg=COLORS["surface"])
+        buttons.grid(row=4, column=0, columnspan=2, sticky="e", padx=24, pady=(10, 18))
+        tk.Button(buttons, text="取消", command=dialog.destroy, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["muted"], font=(FONT, 9), padx=10, pady=7).pack(side="left", padx=5)
+
+        def save() -> None:
+            raw = value.get().strip()
+            try:
+                threshold = float(raw)
+                if threshold < 0 or threshold > 1_000_000:
+                    raise ValueError
+                self.manager.set_disk_alert_gb(server_id, threshold)
+                self.refresh_state()
+                if on_saved:
+                    on_saved()
+                dialog.destroy()
+                self.set_status(f"{name} 磁盘告警容量已设为 {threshold:g} GB" if threshold else f"{name} 磁盘告警已关闭")
+            except ValueError:
+                messagebox.showwarning("容量无效", "请输入 0 到 1,000,000 之间的 GB 数值。", parent=dialog)
+            except Exception as exc:
+                messagebox.showerror("设置未保存", str(exc), parent=dialog)
+
+        tk.Button(buttons, text="保存设置  →", command=save, relief="flat", bd=0, bg=COLORS["green"], fg="#ffffff", font=(FONT, 9, "bold"), padx=13, pady=7).pack(side="left", padx=5)
 
     def open_connection_dialog(self, server_id: str | None = None, parent: tk.Misc | None = None, on_saved: Any = None, new_server: bool = False) -> None:
         target_parent = parent or self
@@ -2072,8 +2286,10 @@ class DesktopClient(tk.Tk):
         if initial_env and initial_env not in envs:
             envs.insert(0, initial_env)
         priority_var = tk.StringVar(value=str((experiment or {}).get("priority") if editing else 50))
-        level_var = tk.StringVar(value=str((experiment or {}).get("execution_level") if editing else "idle_only"))
+        level_code = str((experiment or {}).get("execution_level") if editing else "idle_only")
+        level_var = tk.StringVar(value=EXECUTION_LEVEL_LABELS.get(level_code, EXECUTION_LEVEL_LABELS["idle_only"]))
         memory_var = tk.StringVar(value=str((experiment or {}).get("peak_memory_mb") if editing else (prefs.get("peak_memory_mb") or "")))
+        max_util_var = tk.StringVar(value=str((experiment or {}).get("max_gpu_utilization", 30) if editing else prefs.get("max_gpu_utilization", 30)))
         auto_var = tk.BooleanVar(value=bool((experiment or {}).get("auto_retry_oom", True)))
         initial_dependencies = set(self._normalize_dependency_ids((experiment or {}).get("depends_on", [])))
         server_options = [f"{item.get('name') or item.get('host') or item.get('id')} · {item.get('host') or '未配置'}" for item in self.state.get("servers", [])]
@@ -2190,7 +2406,8 @@ class DesktopClient(tk.Tk):
                 env_var.set(selected_env if selected_env in env_values else "默认 Python")
                 memory_var.set(str(selected_prefs.get("peak_memory_mb") or ""))
                 selected_level = selected_prefs.get("execution_level") or "idle_only"
-                level_var.set(selected_level if selected_level in ("idle_only", "emergency") else "idle_only")
+                level_var.set(EXECUTION_LEVEL_LABELS.get(selected_level, EXECUTION_LEVEL_LABELS["idle_only"]))
+                max_util_var.set(str(selected_prefs.get("max_gpu_utilization", 30)))
 
         server_combo.bind("<<ComboboxSelected>>", apply_server_defaults)
         apply_server_defaults()
@@ -2199,16 +2416,27 @@ class DesktopClient(tk.Tk):
         row_label(10, "优先级（越小越先）")
         self._spinbox(dialog, textvariable=priority_var, from_=1, to=999, width=33).grid(row=10, column=1, padx=(10, 25), pady=(0, 10))
         row_label(11, "执行级别")
-        ttk.Combobox(dialog, textvariable=level_var, state="readonly", values=("idle_only", "emergency"), width=32).grid(row=11, column=1, padx=(10, 25), pady=(0, 10))
-        row_label(12, "峰值显存（MB）")
-        self._entry(dialog, textvariable=memory_var, width=35).grid(row=12, column=1, padx=(10, 25), pady=(0, 4))
-        tk.Label(dialog, text="填 0 或留空 = 自动学习；OOM 后自动提高门槛。", bg=COLORS["surface"], fg="#9aa7a0", font=(FONT, 8)).grid(row=13, column=1, sticky="w", padx=(10, 25), pady=(0, 8))
-        self._checkbutton(dialog, text="显存不足后自动等待重试", variable=auto_var).grid(row=14, column=0, columnspan=2, sticky="w", padx=25, pady=(0, 8))
+        level_combo = ttk.Combobox(dialog, textvariable=level_var, state="readonly", values=tuple(EXECUTION_LEVEL_LABELS.values()), width=32)
+        level_combo.grid(row=11, column=1, padx=(10, 25), pady=(0, 10))
+        row_label(12, "忙卡利用率上限（%）")
+        max_util_entry = self._spinbox(dialog, textvariable=max_util_var, from_=0, to=100, width=33)
+        max_util_entry.grid(row=12, column=1, padx=(10, 25), pady=(0, 3))
+        tk.Label(dialog, text="低干扰执行时，最近采样的最高 GPU 利用率需低于此值。", bg=COLORS["surface"], fg="#9aa7a0", font=(FONT, 8)).grid(row=13, column=1, sticky="w", padx=(10, 25), pady=(0, 8))
+        row_label(14, "峰值显存（MB）")
+        self._entry(dialog, textvariable=memory_var, width=35).grid(row=14, column=1, padx=(10, 25), pady=(0, 4))
+        tk.Label(dialog, text="填 0 或留空 = 自动学习；OOM 后自动提高门槛。", bg=COLORS["surface"], fg="#9aa7a0", font=(FONT, 8)).grid(row=15, column=1, sticky="w", padx=(10, 25), pady=(0, 8))
+        self._checkbutton(dialog, text="显存不足后自动等待重试", variable=auto_var).grid(row=16, column=0, columnspan=2, sticky="w", padx=25, pady=(0, 8))
         buttons = tk.Frame(dialog, bg=COLORS["surface"])
-        buttons.grid(row=15, column=0, columnspan=2, sticky="e", padx=25, pady=18)
+        buttons.grid(row=17, column=0, columnspan=2, sticky="e", padx=25, pady=18)
         tk.Button(buttons, text="取消", command=dialog.destroy, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["muted"], font=(FONT, 9), padx=10, pady=7).pack(side="left", padx=5)
         submit = tk.Button(buttons, text="保存并重新等待  →" if editing else "加入队列  →", relief="flat", bd=0, bg=COLORS["green"], fg="#ffffff", font=(FONT, 9, "bold"), padx=13, pady=7)
         submit.pack(side="left", padx=5)
+
+        def update_util_entry(_event: Any = None) -> None:
+            max_util_entry.configure(state="normal" if EXECUTION_LEVEL_KEYS.get(level_var.get()) == "low_interference" else "disabled")
+
+        level_combo.bind("<<ComboboxSelected>>", update_util_entry)
+        update_util_entry()
 
         def submit_experiment() -> None:
             script = path_var.get()
@@ -2216,7 +2444,7 @@ class DesktopClient(tk.Tk):
                 messagebox.showwarning("缺少脚本", "请选择一个 .sh 文件。", parent=dialog)
                 return
             name = clean_name(name_var.get(), Path(script).stem)
-            level = level_var.get() if level_var.get() in ("idle_only", "emergency") else "idle_only"
+            level = EXECUTION_LEVEL_KEYS.get(level_var.get(), "idle_only")
             env = "" if env_var.get() == "默认 Python" else env_var.get()
             remember_dependencies()
             depends_on = [
@@ -2227,9 +2455,9 @@ class DesktopClient(tk.Tk):
             selected_server_id = server_ids[server_options.index(server_var.get())] if server_var.get() in server_options else active_server_id
             try:
                 if editing:
-                    self.update_experiment(experiment["id"], name, script, workdir_var.get().strip(), env, safe_int(priority_var.get(), 50), level, max(0, safe_int(memory_var.get(), 0)), auto_var.get(), depends_on)
+                    self.update_experiment(experiment["id"], name, script, workdir_var.get().strip(), env, safe_int(priority_var.get(), 50), level, max(0, safe_int(memory_var.get(), 0)), auto_var.get(), max(0, min(100, safe_int(max_util_var.get(), 30))), depends_on)
                 else:
-                    self.add_experiment(selected_server_id, name, script, workdir_var.get().strip(), env, safe_int(priority_var.get(), 50), level, max(0, safe_int(memory_var.get(), 0)), auto_var.get(), depends_on)
+                    self.add_experiment(selected_server_id, name, script, workdir_var.get().strip(), env, safe_int(priority_var.get(), 50), level, max(0, safe_int(memory_var.get(), 0)), auto_var.get(), max(0, min(100, safe_int(max_util_var.get(), 30))), depends_on)
                 dialog.destroy()
                 self.set_status("实验配置已更新并重新进入等待队列" if editing else "实验已加入队列")
             except Exception as exc:
@@ -2290,7 +2518,7 @@ class DesktopClient(tk.Tk):
         if has_cycle(exp_id):
             raise ValueError("前序任务不能形成循环依赖")
 
-    def update_experiment(self, exp_id: str, name: str, script: str, workdir: str, env: str, priority: int, level: str, peak: int, auto_retry: bool, depends_on: list[str] | None = None) -> None:
+    def update_experiment(self, exp_id: str, name: str, script: str, workdir: str, env: str, priority: int, level: str, peak: int, auto_retry: bool, max_gpu_utilization: int = 30, depends_on: list[str] | None = None) -> None:
         depends_on = self._normalize_dependency_ids(depends_on or [])
         self._validate_dependency_ids(exp_id, depends_on)
         with self.manager.store.lock:
@@ -2338,6 +2566,7 @@ class DesktopClient(tk.Tk):
                 "conda_env": env,
                 "priority": max(1, min(999, priority)),
                 "execution_level": level,
+                "max_gpu_utilization": max(0, min(100, safe_int(max_gpu_utilization, 30))),
                 "peak_memory_mb": max(0, peak),
                 "auto_peak_memory_mb": 0,
                 "auto_retry_oom": auto_retry,
@@ -2355,13 +2584,13 @@ class DesktopClient(tk.Tk):
                 "process_group_id": 0,
             })
             if record is not None:
-                record.setdefault("preferences", {}).update({"workdir": workdir, "conda_env": env, "peak_memory_mb": max(0, peak), "execution_level": level})
-            data.setdefault("preferences", {}).update({"workdir": workdir, "conda_env": env, "peak_memory_mb": max(0, peak), "execution_level": level})
+                record.setdefault("preferences", {}).update({"workdir": workdir, "conda_env": env, "peak_memory_mb": max(0, peak), "execution_level": level, "max_gpu_utilization": max(0, min(100, safe_int(max_gpu_utilization, 30)))})
+            data.setdefault("preferences", {}).update({"workdir": workdir, "conda_env": env, "peak_memory_mb": max(0, peak), "execution_level": level, "max_gpu_utilization": max(0, min(100, safe_int(max_gpu_utilization, 30)))})
             self.manager.store.save()
         if target_runtime.connected and new_status == "queued":
             self._tick_in_background()
 
-    def add_experiment(self, server_id: str, name: str, script: str, workdir: str, env: str, priority: int, level: str, peak: int, auto_retry: bool, depends_on: list[str] | None = None) -> None:
+    def add_experiment(self, server_id: str, name: str, script: str, workdir: str, env: str, priority: int, level: str, peak: int, auto_retry: bool, max_gpu_utilization: int = 30, depends_on: list[str] | None = None) -> None:
         UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
         exp_id = uuid.uuid4().hex[:12]
         depends_on = self._normalize_dependency_ids(depends_on or [])
@@ -2398,6 +2627,7 @@ class DesktopClient(tk.Tk):
                 "conda_env": env,
                 "priority": max(1, min(999, priority)),
                 "execution_level": level,
+                "max_gpu_utilization": max(0, min(100, safe_int(max_gpu_utilization, 30))),
                 "peak_memory_mb": max(0, peak),
                 "auto_peak_memory_mb": 0,
                 "auto_retry_oom": auto_retry,
@@ -2414,8 +2644,8 @@ class DesktopClient(tk.Tk):
                 "validation_error": "",
             })
             if record is not None:
-                record.setdefault("preferences", {}).update({"workdir": workdir, "conda_env": env, "peak_memory_mb": max(0, peak), "execution_level": level})
-            data.setdefault("preferences", {}).update({"workdir": workdir, "conda_env": env, "peak_memory_mb": max(0, peak), "execution_level": level})
+                record.setdefault("preferences", {}).update({"workdir": workdir, "conda_env": env, "peak_memory_mb": max(0, peak), "execution_level": level, "max_gpu_utilization": max(0, min(100, safe_int(max_gpu_utilization, 30)))})
+            data.setdefault("preferences", {}).update({"workdir": workdir, "conda_env": env, "peak_memory_mb": max(0, peak), "execution_level": level, "max_gpu_utilization": max(0, min(100, safe_int(max_gpu_utilization, 30)))})
             self.manager.store.save()
         if target_runtime.connected and initial_status == "queued":
             self._tick_in_background()
@@ -2548,4 +2778,3 @@ class DesktopClient(tk.Tk):
 if __name__ == "__main__":
     client = DesktopClient()
     client.mainloop()
-

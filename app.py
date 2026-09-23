@@ -101,7 +101,10 @@ class StateStore:
                 "conda_env": "",
                 "peak_memory_mb": 0,
                 "execution_level": "idle_only",
+                "max_gpu_utilization": 30,
             },
+            "global_settings": {"gpu_history_samples": 5},
+            "gpu_history": {},
             "experiments": [],
             "next_experiment_no": 1,
             "benchmark_history": [],
@@ -206,14 +209,15 @@ class RemoteClient:
                 raise RuntimeError("尚未连接服务器")
             self.sftp.put(str(local_path), remote_path)
 
-    def read_text(self, remote_path: str, tail: int = 120000) -> str:
+    def read_text(self, remote_path: str, tail: int | None = 120000) -> str:
         with self.lock:
             if not self.connected or not self.sftp:
                 raise RuntimeError("尚未连接服务器")
             with self.sftp.open(remote_path, "rb") as handle:
-                handle.seek(0, os.SEEK_END)
-                size = handle.tell()
-                handle.seek(max(0, size - tail), os.SEEK_SET)
+                if tail is not None:
+                    handle.seek(0, os.SEEK_END)
+                    size = handle.tell()
+                    handle.seek(max(0, size - max(0, tail)), os.SEEK_SET)
                 return handle.read().decode("utf-8", errors="replace")
 
 
@@ -240,6 +244,7 @@ class Runtime:
         }
         self.stop_event = threading.Event()
         self._server_record()
+        self.disk_guard["threshold_bytes"] = int(max(0, safe_float(self._server_record().get("disk_alert_gb"), 5)) * 1024**3)
         self.thread = threading.Thread(target=self._loop, name="gpu-orchestrator", daemon=True)
         self.thread.start()
 
@@ -267,6 +272,7 @@ class Runtime:
         record.setdefault("enabled", True)
         record.setdefault("scheduler_paused", False)
         record.setdefault("scheduler_pause_reason", "")
+        record.setdefault("disk_alert_gb", 5)
         return record
 
     def _profile_data(self) -> dict[str, Any]:
@@ -361,7 +367,7 @@ class Runtime:
             self.disk_guard = {
                 "blocked": False,
                 "free_bytes": None,
-                "threshold_bytes": DISK_GUARD_MIN_FREE_BYTES,
+                "threshold_bytes": int(max(0, safe_float(self._server_record().get("disk_alert_gb"), 5)) * 1024**3),
                 "message": "",
             }
 
@@ -443,25 +449,27 @@ PY
     def _update_disk_guard(self, snapshot: dict[str, Any] | None) -> bool:
         disk = (snapshot or {}).get("disk") or {}
         free_bytes = safe_int(disk.get("free_bytes"), -1)
+        threshold_gb = max(0, safe_float(self._server_record().get("disk_alert_gb"), 5))
+        threshold_bytes = int(threshold_gb * 1024**3)
         if free_bytes < 0:
             self.disk_guard = {
                 "blocked": False,
                 "free_bytes": None,
-                "threshold_bytes": DISK_GUARD_MIN_FREE_BYTES,
+                "threshold_bytes": threshold_bytes,
                 "message": "",
             }
             return False
-        blocked = free_bytes < DISK_GUARD_MIN_FREE_BYTES
+        blocked = threshold_bytes > 0 and free_bytes < threshold_bytes
         message = (
             f"主目录可用空间仅 {max(0, free_bytes) / 1024**3:.1f} GB，"
-            f"低于安全阈值 {DISK_GUARD_MIN_FREE_MB} MB"
+            f"低于告警阈值 {threshold_gb:g} GB"
             if blocked
             else ""
         )
         self.disk_guard = {
             "blocked": blocked,
             "free_bytes": free_bytes,
-            "threshold_bytes": DISK_GUARD_MIN_FREE_BYTES,
+            "threshold_bytes": threshold_bytes,
             "message": message,
         }
         return blocked
@@ -504,6 +512,48 @@ PY
                 result[idx] = item
         return result
 
+    def _gpu_history_key(self, gpu: dict[str, Any]) -> str:
+        return str(gpu.get("uuid") or f"index:{safe_int(gpu.get('index'), -1)}")
+
+    def _history_sample_count(self) -> int:
+        with self.store.lock:
+            settings = self.store.data.setdefault("global_settings", {})
+            count = safe_int(settings.get("gpu_history_samples"), 5)
+        return max(1, min(120, count))
+
+    def _record_gpu_history(self, snapshot: dict[str, Any] | None) -> None:
+        if snapshot is None:
+            return
+        count = self._history_sample_count()
+        with self.store.lock:
+            servers = self.store.data.setdefault("gpu_history", {})
+            per_gpu = servers.setdefault(self.server_id, {})
+            sampled_at = str(snapshot.get("polled_at") or now_iso())
+            for gpu in snapshot.get("gpus", []):
+                history = per_gpu.setdefault(self._gpu_history_key(gpu), [])
+                history.append({
+                    "sampled_at": sampled_at,
+                    "memory_used_mb": max(0, safe_int(gpu.get("memory_used_mb"), 0)),
+                    "utilization_gpu": max(0, safe_float(gpu.get("utilization_gpu"), 0)),
+                })
+                del history[:-count]
+
+    def _gpu_history_baseline(self, gpu: dict[str, Any]) -> dict[str, Any]:
+        count = self._history_sample_count()
+        with self.store.lock:
+            histories = self.store.data.setdefault("gpu_history", {}).get(self.server_id, {})
+            samples = list(histories.get(self._gpu_history_key(gpu), []))[-count:]
+        if not samples:
+            samples = [{
+                "memory_used_mb": gpu.get("memory_used_mb", 0),
+                "utilization_gpu": gpu.get("utilization_gpu", 0),
+            }]
+        return {
+            "memory_peak_mb": max(safe_int(item.get("memory_used_mb"), 0) for item in samples),
+            "utilization_peak": max(safe_float(item.get("utilization_gpu"), 0) for item in samples),
+            "sample_count": len(samples),
+        }
+
     def _enrich_snapshot(self, snapshot: dict[str, Any] | None) -> dict[str, Any] | None:
         if snapshot is None:
             return None
@@ -526,12 +576,12 @@ PY
             gpu["scheduler_free_mb"] = max(0, safe_int(gpu.get("memory_free_mb"), 0) - safe_int(gpu.get("reserved_mb"), 0))
         return enriched
 
-    def _read_log(self, exp: dict[str, Any]) -> str:
+    def _read_log(self, exp: dict[str, Any], max_bytes: int | None = 60000) -> str:
         path = exp.get("log_path")
         if not path or not self.connected:
             return ""
         try:
-            return self.remote.read_text(path, tail=60000)
+            return self.remote.read_text(path, tail=max_bytes)
         except Exception:
             return ""
 
@@ -604,14 +654,27 @@ PY
             return None
         required = max(0, safe_int(exp.get("peak_memory_mb"), 0))
         level = exp.get("execution_level", "idle_only")
+        max_utilization = max(0, min(100, safe_float(exp.get("max_gpu_utilization"), 30)))
         eligible = []
         for gpu in self.snapshot.get("gpus", []):
-            free_mb = safe_int(gpu.get("scheduler_free_mb", gpu.get("memory_free_mb")), 0)
-            enough = free_mb >= required
             idle = bool(gpu.get("scheduler_idle", gpu.get("is_idle")))
+            free_mb = safe_int(gpu.get("scheduler_free_mb", gpu.get("memory_free_mb")), 0)
+            baseline = None
+            if not idle:
+                baseline = self._gpu_history_baseline(gpu)
+                total_mb = max(0, safe_int(gpu.get("memory_total_mb"), 0))
+                reserved_mb = max(0, safe_int(gpu.get("reserved_mb"), 0))
+                historical_free_mb = max(0, total_mb - baseline["memory_peak_mb"] - reserved_mb)
+                free_mb = min(free_mb, historical_free_mb)
+                gpu["scheduler_memory_peak_mb"] = baseline["memory_peak_mb"]
+                gpu["scheduler_utilization_peak_percent"] = baseline["utilization_peak"]
+                gpu["scheduler_history_samples"] = baseline["sample_count"]
+            enough = free_mb >= required
+            if level == "low_interference" and not idle:
+                enough = enough and (baseline or self._gpu_history_baseline(gpu))["utilization_peak"] < max_utilization
             if enough:
                 eligible.append((gpu, idle))
-        if level == "emergency":
+        if level in ("emergency", "low_interference"):
             idle_choices = [gpu for gpu, idle in eligible if idle]
             choices = idle_choices or [gpu for gpu, _idle in eligible]
         else:
@@ -881,6 +944,7 @@ PY
             try:
                 self.poll()
                 self._update_disk_guard(self.snapshot)
+                self._record_gpu_history(self.snapshot)
                 self._finish_running()
                 if self.disk_guard.get("blocked"):
                     self._pause_waiting_for_disk()
@@ -956,6 +1020,7 @@ PY
                 "last_poll_at": self.last_poll_at,
                 "remote_root": self.remote_root,
                 "disk_guard": dict(self.disk_guard),
+                "global_settings": dict(self.store.data.setdefault("global_settings", {})),
                 "scheduler_paused": bool(record.get("scheduler_paused")),
                 "scheduler_pause_reason": record.get("scheduler_pause_reason", ""),
             }
@@ -1025,8 +1090,9 @@ def api_create_experiment():
     env = str(request.form.get("conda_env", "")).strip() or str(prefs.get("conda_env", "")).strip()
     peak = max(0, safe_int(request.form.get("peak_memory_mb"), safe_int(prefs.get("peak_memory_mb"), 0)))
     level = request.form.get("execution_level", "idle_only")
-    if level not in ("idle_only", "emergency"):
+    if level not in ("idle_only", "low_interference", "emergency"):
         level = "idle_only"
+    max_gpu_utilization = max(0, min(100, safe_int(request.form.get("max_gpu_utilization"), 30)))
     priority = max(1, min(999, safe_int(request.form.get("priority"), 50)))
     name = clean_name(request.form.get("name", ""), Path(upload.filename).stem)
     seq = max([safe_int(item.get("created_seq"), 0) for item in store.data.get("experiments", [])] or [0]) + 1
@@ -1042,6 +1108,7 @@ def api_create_experiment():
         "conda_env": env,
         "priority": priority,
         "execution_level": level,
+        "max_gpu_utilization": max_gpu_utilization,
         "peak_memory_mb": peak,
         "auto_peak_memory_mb": 0,
         "auto_retry_oom": request.form.get("auto_retry_oom") == "true",
@@ -1056,7 +1123,7 @@ def api_create_experiment():
         "validation_error": "",
     }
     store.data.setdefault("experiments", []).append(experiment)
-    prefs.update({"workdir": workdir, "conda_env": env, "peak_memory_mb": peak, "execution_level": level})
+    prefs.update({"workdir": workdir, "conda_env": env, "peak_memory_mb": peak, "execution_level": level, "max_gpu_utilization": max_gpu_utilization})
     store.save()
     if runtime.connected:
         try:
@@ -1106,7 +1173,11 @@ def api_log(exp_id: str):
     if not runtime.connected:
         return jsonify({"log": "当前未连接服务器", "path": item.get("log_path", "")})
     try:
-        return jsonify({"log": runtime._read_log(item), "path": item.get("log_path", "")})
+        full = request.args.get("full") == "1"
+        log = runtime._read_log(item, max_bytes=None if full else 12000)
+        if not full:
+            log = "".join(log.splitlines(keepends=True)[-200:])
+        return jsonify({"log": log, "path": item.get("log_path", "")})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 400
 
@@ -1136,12 +1207,19 @@ def api_preferences():
             prefs["conda_env"] = str(payload.get("conda_env") or "")
         if "peak_memory_mb" in payload:
             prefs["peak_memory_mb"] = max(0, safe_int(payload.get("peak_memory_mb"), 0))
-        if "execution_level" in payload and payload.get("execution_level") in ("idle_only", "emergency"):
+        if "execution_level" in payload and payload.get("execution_level") in ("idle_only", "low_interference", "emergency"):
             prefs["execution_level"] = payload.get("execution_level")
+        if "max_gpu_utilization" in payload:
+            prefs["max_gpu_utilization"] = max(0, min(100, safe_int(payload.get("max_gpu_utilization"), 30)))
+        if "gpu_history_samples" in payload:
+            count = max(1, min(120, safe_int(payload.get("gpu_history_samples"), 5)))
+            store.data.setdefault("global_settings", {})["gpu_history_samples"] = count
+            for server_history in store.data.setdefault("gpu_history", {}).values():
+                for history in server_history.values():
+                    del history[:-count]
         store.save()
     return jsonify(runtime.public_state())
 
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=8765, debug=False, threaded=True)
-
