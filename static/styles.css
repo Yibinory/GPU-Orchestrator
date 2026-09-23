@@ -198,6 +198,23 @@ button { cursor: pointer; }
 .global-settings-row input { width: 120px; border: 1px solid #dce6e1; border-radius: 7px; outline: 0; padding: 10px 11px; background: #fbfdfc; color: #304039; font-size: 12px; font-weight: 500; }
 .global-settings-row input:focus { border-color: #80ceb0; box-shadow: 0 0 0 3px #e7f7ef; }
 .global-settings-row small { color: #9aa7a0; font-size: 9px; font-weight: 400; }
+.gpu-status.status-button { border: 0; background: transparent; padding: 0; font: inherit; cursor: pointer; transition: .18s; }
+.gpu-status.status-button:hover { color: var(--green-dark); }
+.gpu-status.status-button:hover i { box-shadow: 0 0 0 3px rgba(19,166,115,.14); }
+.process-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 16px 0 14px; padding: 13px 15px; border: 1px solid #e2ece7; border-radius: 10px; background: var(--surface-soft); }
+.process-summary strong { color: var(--ink); font-size: 12px; }
+.process-list { display: grid; gap: 10px; max-height: 470px; overflow-y: auto; padding-right: 4px; }
+.process-card { padding: 13px 15px 12px; border: 1px solid #e6ede9; border-radius: 10px; background: var(--surface-soft); }
+.process-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.process-user { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.user-avatar { display: grid; place-items: center; width: 28px; height: 28px; flex: 0 0 auto; border-radius: 50%; background: var(--mint); color: var(--green-dark); font: 700 11px 'DM Mono', monospace; }
+.process-user strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #33443d; font-size: 12px; }
+.process-meta { display: flex; flex-wrap: wrap; gap: 6px; }
+.process-chip { display: inline-flex; align-items: center; padding: 4px 8px; border-radius: 6px; background: #edf2ef; color: #5f6f68; font: 500 10px 'DM Mono', monospace; }
+.process-chip.memory { background: #e9f0fb; color: #3f5f9e; }
+.process-cmd { display: grid; grid-template-columns: 30px 1fr; gap: 9px; align-items: start; margin-top: 10px; }
+.process-cmd > span { color: #93a09a; font-size: 10px; line-height: 1.8; }
+.process-cmd code { display: block; margin: 0; padding: 9px 11px; border-radius: 8px; background: #122c27; color: #a6c8b7; font: 10px/1.7 'DM Mono', monospace; white-space: pre-wrap; word-break: break-all; }
 .queue-summary > div { padding: 15px 17px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
 .queue-summary span { display: block; color: #86938d; font-size: 10px; }
 .queue-summary strong { display: block; margin-top: 7px; color: var(--ink); font-size: 23px; letter-spacing: -.04em; }

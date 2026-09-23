@@ -8,7 +8,8 @@ const UI = {
   selectedLog: null,
   editingExperimentId: null,
   editingServerId: null,
-  sshHosts: []
+  sshHosts: [],
+  openProcesses: null
 };
 
 const statusLabels = {
@@ -50,6 +51,19 @@ function fmtTime(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
   return date.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+}
+
+function fmtDuration(seconds) {
+  const total = Number(seconds || 0);
+  if (total <= 0) return '—';
+  const days = Math.floor(total / 86400);
+  const hours = Math.floor((total % 86400) / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = Math.floor(total % 60);
+  if (days) return days + ' 天 ' + hours + ' 小时';
+  if (hours) return hours + ' 小时 ' + minutes + ' 分';
+  if (minutes) return minutes + ' 分 ' + secs + ' 秒';
+  return secs + ' 秒';
 }
 
 function taskNo(item) {
@@ -239,16 +253,23 @@ function renderGpuFleet() {
     const idle = gpu.scheduler_idle && !gpu.reserved_mb;
     const tempClass = Number(gpu.temperature_c || 0) > 80 ? 'hot' : '';
     const speed = benchmark.tensor_tflops ? Number(benchmark.tensor_tflops).toFixed(2) + ' TFLOPS' : '未测试';
+    const processCount = Number(gpu.process_count || 0);
+    const statusHtml = processCount > 0
+      ? '<button class="gpu-status busy status-button" data-processes="' + esc(gpu.index) + '" title="查看进程详情"><i></i>' + processCount + ' 个进程</button>'
+      : '<span class="gpu-status ' + (idle ? 'idle' : 'busy') + '"><i></i>' + (idle ? '空闲可调度' : (gpu.reserved_mb ? '队列已占用' : '0 个进程')) + '</span>';
     return '<article class="gpu-card">' +
       '<div class="gpu-card-top"><div><div class="gpu-index">GPU ' + esc(gpu.index) + '</div></div><div class="gpu-temp ' + tempClass + '">' + esc(gpu.temperature_c == null ? '—' : gpu.temperature_c) + '°C</div></div>' +
       '<div class="gpu-name" title="' + esc(gpu.name) + '">' + esc(gpu.name || 'Unknown GPU') + '</div>' +
       '<div class="gpu-id">' + esc((gpu.uuid || '').replace('GPU-', '').slice(0, 20)) + '</div>' +
       '<div class="gpu-meters"><div class="meter-row"><span>显存</span><div class="meter-track"><div class="meter-fill memory" style="width:' + pct(memoryPercent) + '"></div></div><span class="meter-number">' + memoryPercent.toFixed(1) + '%</span></div>' +
       '<div class="meter-row"><span>利用率</span><div class="meter-track"><div class="meter-fill util" style="width:' + pct(utilization) + '"></div></div><span class="meter-number">' + utilization.toFixed(1) + '%</span></div></div>' +
-      '<div class="gpu-foot"><span class="gpu-status ' + (idle ? 'idle' : 'busy') + '"><i></i>' + (idle ? '空闲可调度' : (gpu.reserved_mb ? '队列已占用' : (gpu.process_count || 0) + ' 个进程')) + '</span><span><strong>' + esc(speed) + '</strong></span><button class="gpu-test-mini" data-benchmark="' + esc(gpu.index) + '">测试 ϟ</button></div></article>';
+      '<div class="gpu-foot">' + statusHtml + '<span><strong>' + esc(speed) + '</strong></span><button class="gpu-test-mini" data-benchmark="' + esc(gpu.index) + '">测试 ϟ</button></div></article>';
   }).join('');
   $$('[data-benchmark]').forEach(function (button) {
     button.addEventListener('click', function () { runBenchmark(Number(button.dataset.benchmark)); });
+  });
+  $$('[data-processes]').forEach(function (button) {
+    button.addEventListener('click', function () { openProcessModal(UI.data.active_server_id, Number(button.dataset.processes)); });
   });
 }
 
@@ -523,6 +544,7 @@ function renderAll() {
   renderBenchmarks();
   renderHistory();
   renderServers();
+  renderProcessModal();
   if (UI.view === 'logs') renderLogs();
 }
 
@@ -691,6 +713,51 @@ function fillFromSshHost(host, prefix) {
   set(prefix + '-port', host.port || 22);
   set(prefix + '-username', host.user || '');
   set(prefix + '-identity', host.identity_file || '');
+}
+
+function openProcessModal(serverId, gpuIndex) {
+  UI.openProcesses = { serverId: serverId, gpuIndex: gpuIndex };
+  renderProcessModal(true);
+}
+
+function renderProcessModal(force) {
+  const modal = $('#process-modal');
+  if (!UI.openProcesses || (modal.classList.contains('hidden') && !force)) return;
+  const state = (UI.data.server_states || {})[UI.openProcesses.serverId] || {};
+  const gpus = (state.snapshot && state.snapshot.gpus) || [];
+  const gpu = gpus.find(function (item) { return Number(item.index) === UI.openProcesses.gpuIndex; });
+  if (!gpu) {
+    $('#process-modal-title').textContent = '进程详情';
+    $('#process-summary').innerHTML = '';
+    $('#process-list').innerHTML = '<div class="empty-state compact">暂无该显卡数据</div>';
+    return;
+  }
+  $('#process-modal-title').textContent = 'GPU ' + esc(gpu.index) + ' 进程详情';
+  const processes = (gpu.processes || []).slice().sort(function (a, b) {
+    return Number(b.memory_mb || 0) - Number(a.memory_mb || 0);
+  });
+  const totalMb = processes.reduce(function (sum, item) { return sum + Number(item.memory_mb || 0); }, 0);
+  $('#process-summary').innerHTML =
+    '<strong>' + esc(gpu.name || 'Unknown GPU') + '</strong>' +
+    '<span class="process-chip">' + processes.length + ' 个进程</span>' +
+    '<span class="process-chip memory">显存占用合计 ' + esc(fmtMb(totalMb)) + '</span>' +
+    '<span class="process-chip">利用率 ' + Number(gpu.utilization_gpu || 0).toFixed(1) + '%</span>';
+  const root = $('#process-list');
+  const prevScroll = root.scrollTop;
+  if (!processes.length) {
+    root.innerHTML = '<div class="empty-state compact">该显卡当前没有计算进程</div>';
+  } else {
+    root.innerHTML = processes.map(function (item) {
+      const user = item.user || '未知用户';
+      const command = item.command || item.name || '—';
+      return '<article class="process-card">' +
+        '<div class="process-head"><div class="process-user"><span class="user-avatar">' + esc(user.slice(0, 1).toUpperCase()) + '</span><strong title="' + esc(user) + '">' + esc(user) + '</strong></div>' +
+        '<div class="process-meta"><span class="process-chip">PID ' + esc(item.pid) + '</span><span class="process-chip">⏱ ' + esc(fmtDuration(item.runtime_seconds)) + '</span><span class="process-chip memory">' + esc(fmtMb(item.memory_mb)) + '</span></div></div>' +
+        '<div class="process-cmd"><span>命令</span><code title="' + esc(command) + '">' + esc(command) + '</code></div></article>';
+    }).join('');
+    root.scrollTop = prevScroll;
+  }
+  if (force) setModal('process-modal', true);
 }
 
 /* ---------- data refresh ---------- */

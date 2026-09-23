@@ -44,6 +44,33 @@ def process_runtime(pid: int) -> int:
         return 0
 
 
+def process_owner(pid: int) -> str:
+    """Best-effort process owner name; empty string when procfs is unreadable."""
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("Uid:"):
+                uid = int(line.split()[1])
+                try:
+                    import pwd
+
+                    return pwd.getpwuid(uid).pw_name
+                except Exception:
+                    return str(uid)
+    except (OSError, ValueError, IndexError):
+        pass
+    return ""
+
+
+def process_command(pid: int) -> str:
+    """Best-effort full command line; empty string when procfs is unreadable."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        text = raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+        return text[:500]
+    except OSError:
+        return ""
+
+
 def cpu_usage() -> float:
     def read() -> tuple[float, float]:
         fields = Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0].split()
@@ -106,12 +133,15 @@ def gpu_stats() -> list[dict[str, object]]:
         for row in csv.reader(pstdout.splitlines(), skipinitialspace=True):
             if len(row) < 4:
                 continue
+            pid = int(number(row[1], 0))
             processes.setdefault(row[0].strip(), []).append(
                 {
-                    "pid": int(number(row[1], 0)),
+                    "pid": pid,
                     "name": row[2].strip(),
                     "memory_mb": int(number(row[3], 0)),
-                    "runtime_seconds": process_runtime(int(number(row[1], 0))),
+                    "runtime_seconds": process_runtime(pid),
+                    "user": process_owner(pid),
+                    "command": process_command(pid),
                 }
             )
     result = []
