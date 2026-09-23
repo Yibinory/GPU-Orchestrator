@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
+import ctypes
 import shutil
+import sys
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -36,6 +39,9 @@ COLORS = {
 FONT = "Microsoft YaHei UI"
 MONO = "Consolas"
 SHANGHAI_TZ = timezone(timedelta(hours=8))
+ASSET_DIR = Path(__file__).resolve().parent / "assets"
+APP_LOGO_PATH = ASSET_DIR / "gpu_orchestrator_icon.png"
+APP_ICON_PATH = ASSET_DIR / "gpu_orchestrator.ico"
 
 
 def fmt_bytes(value: Any) -> str:
@@ -85,6 +91,13 @@ def fmt_duration(value: Any) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+def task_identifier(item: dict[str, Any]) -> str:
+    number = safe_int(item.get("task_no"), 0)
+    if number > 0:
+        return f"#{number:04d}"
+    return f"#{str(item.get('id') or 'unknown')[:8]}"
+
+
 STATUS_LABELS = {
     "queued": "等待调度",
     "running": "运行中",
@@ -103,6 +116,7 @@ class DesktopRuntimeManager:
         self.store = store
         self.runtimes: dict[str, Runtime] = {"default": default_runtime}
         self._ensure_server_config()
+        self._ensure_experiment_numbers()
         self._sync_runtimes()
 
     def _ensure_server_config(self) -> None:
@@ -144,6 +158,36 @@ class DesktopRuntimeManager:
         active = data.get("active_server_id")
         if not active or not any(item.get("id") == active for item in servers):
             data["active_server_id"] = servers[0].get("id", "default")
+            changed = True
+        if changed:
+            self.store.save()
+
+    def _ensure_experiment_numbers(self) -> None:
+        """Migrate old tasks and keep a never-reused human-facing task number."""
+        data = self.store.data
+        experiments = data.setdefault("experiments", [])
+        highest = max(
+            [
+                safe_int(item.get("task_no"), safe_int(item.get("created_seq"), 0))
+                for item in experiments
+            ]
+            or [0]
+        )
+        next_number = max(safe_int(data.get("next_experiment_no"), 1), highest + 1, 1)
+        used: set[int] = set()
+        changed = False
+        for item in experiments:
+            number = safe_int(item.get("task_no"), 0)
+            if number <= 0 or number in used:
+                legacy_number = safe_int(item.get("created_seq"), 0)
+                number = legacy_number if legacy_number > 0 and legacy_number not in used else next_number
+            used.add(number)
+            next_number = max(next_number, number + 1)
+            if item.get("task_no") != number:
+                item["task_no"] = number
+                changed = True
+        if safe_int(data.get("next_experiment_no"), 0) != next_number:
+            data["next_experiment_no"] = next_number
             changed = True
         if changed:
             self.store.save()
@@ -342,6 +386,42 @@ class DesktopRuntimeManager:
             server_id = str(stored.get("server_id") or "default")
         self.runtime_for(server_id).terminate_experiment(exp_id)
 
+    def delete_experiment(self, exp_id: str) -> None:
+        local_script: Path | None = None
+        with self.store.lock:
+            stored = self._experiment_record(exp_id)
+            if stored is None:
+                raise ValueError("实验不存在")
+            if stored.get("status") == "running" or stored.get("paused_process"):
+                raise ValueError("正在执行或已暂停进程的任务不能直接删除，请先中断任务")
+            dependents = [
+                item
+                for item in self.store.data.get("experiments", [])
+                if exp_id in [str(value) for value in (item.get("depends_on") or [])]
+            ]
+            if dependents:
+                labels = []
+                for item in dependents[:3]:
+                    task_no = safe_int(item.get("task_no"), 0)
+                    labels.append(f"#{task_no:04d} {item.get('name') or item.get('id')}" if task_no else str(item.get("name") or item.get("id")))
+                raise ValueError("仍有任务依赖它：" + "、".join(labels))
+            raw_script = str(stored.get("local_script") or "").strip()
+            if raw_script:
+                local_script = Path(raw_script)
+            self.store.data["experiments"] = [
+                item for item in self.store.data.get("experiments", [])
+                if str(item.get("id")) != exp_id
+            ]
+            self.store.save()
+        if local_script is not None:
+            try:
+                upload_root = UPLOAD_DIR.resolve()
+                candidate = local_script.resolve()
+                candidate.relative_to(upload_root)
+                candidate.unlink(missing_ok=True)
+            except (OSError, ValueError):
+                pass
+
     def connect(self, server_id: str, profile: dict[str, Any], password: str, save_password: bool) -> dict[str, Any]:
         record = next(item for item in self.store.data.get("servers", []) if item.get("id") == server_id)
         record["profile"] = dict(profile)
@@ -398,6 +478,11 @@ class DesktopRuntimeManager:
 
 class DesktopClient(tk.Tk):
     def __init__(self) -> None:
+        if sys.platform == "win32":
+            try:
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Yibinory.GPUOrchestrator")
+            except (AttributeError, OSError):
+                pass
         super().__init__()
         self.title("算力调度台 · GPU Orchestrator")
         self.geometry("1280x820")
@@ -433,11 +518,38 @@ class DesktopClient(tk.Tk):
         self.last_sync = tk.StringVar(value="尚未同步")
 
         self._configure_styles()
+        self._load_brand_assets()
         self._build_shell()
         self._show_view("dashboard")
         self.after(250, self.refresh_state)
         self.after(750, self.manager.auto_connect)
         self.after(5000, self.refresh_logs_if_needed)
+
+    def _load_brand_assets(self) -> None:
+        """Apply the project logo to the window and keep a small sidebar copy."""
+        self.app_logo_image: tk.PhotoImage | None = None
+        self.sidebar_logo_image: tk.PhotoImage | None = None
+        bitmap_loaded = False
+        try:
+            if APP_ICON_PATH.exists():
+                self.iconbitmap(default=str(APP_ICON_PATH))
+                bitmap_loaded = True
+        except tk.TclError:
+            pass
+        try:
+            if APP_LOGO_PATH.exists():
+                encoded_logo = base64.b64encode(APP_LOGO_PATH.read_bytes()).decode("ascii")
+                self.app_logo_image = tk.PhotoImage(data=encoded_logo)
+                if not bitmap_loaded:
+                    try:
+                        self.iconphoto(True, self.app_logo_image)
+                    except tk.TclError:
+                        pass
+                scale = max(1, self.app_logo_image.width() // 32)
+                self.sidebar_logo_image = self.app_logo_image.subsample(scale, scale)
+        except (OSError, tk.TclError):
+            self.app_logo_image = None
+            self.sidebar_logo_image = None
 
     def _configure_styles(self) -> None:
         style = ttk.Style(self)
@@ -513,11 +625,14 @@ class DesktopClient(tk.Tk):
     def _build_sidebar(self) -> None:
         brand = tk.Frame(self.sidebar, bg=COLORS["navy"])
         brand.pack(fill="x", padx=18, pady=(28, 25))
-        mark = tk.Canvas(brand, width=29, height=30, bg=COLORS["navy"], highlightthickness=0)
-        mark.pack(side="left", padx=(0, 10))
-        mark.create_polygon(3, 25, 8, 25, 13, 9, 9, 9, fill=COLORS["lime"], outline="")
-        mark.create_polygon(11, 25, 16, 25, 22, 3, 18, 3, fill=COLORS["lime"], outline="")
-        mark.create_polygon(19, 25, 24, 25, 28, 12, 24, 12, fill=COLORS["lime"], outline="")
+        if self.sidebar_logo_image is not None:
+            tk.Label(brand, image=self.sidebar_logo_image, bg=COLORS["navy"], bd=0).pack(side="left", padx=(0, 10))
+        else:
+            mark = tk.Canvas(brand, width=29, height=30, bg=COLORS["navy"], highlightthickness=0)
+            mark.pack(side="left", padx=(0, 10))
+            mark.create_polygon(3, 25, 8, 25, 13, 9, 9, 9, fill=COLORS["lime"], outline="")
+            mark.create_polygon(11, 25, 16, 25, 22, 3, 18, 3, fill=COLORS["lime"], outline="")
+            mark.create_polygon(19, 25, 24, 25, 28, 12, 24, 12, fill=COLORS["lime"], outline="")
         tk.Label(brand, text="算力调度台", bg=COLORS["navy"], fg="#f3fff9", font=(FONT, 15, "bold")).pack(anchor="w")
         tk.Label(brand, text="GPU ORCHESTRATOR", bg=COLORS["navy"], fg="#79a495", font=(MONO, 8)).pack(anchor="w", pady=(3, 0))
 
@@ -780,7 +895,8 @@ class DesktopClient(tk.Tk):
         tk.Button(controls, text="暂停 / 继续任务", command=self.toggle_selected_pause, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["green_dark"], font=(FONT, 9), padx=12, pady=7).pack(side="left")
         tk.Button(controls, text="暂停全部任务", command=self.pause_all_tasks, relief="flat", bd=0, bg="#fff5e8", fg=COLORS["amber"], font=(FONT, 9), padx=12, pady=7).pack(side="left", padx=8)
         tk.Button(controls, text="全部重新等待", command=self.resume_all_tasks, relief="flat", bd=0, bg=COLORS["mint"], fg=COLORS["green_dark"], font=(FONT, 9), padx=12, pady=7).pack(side="left")
-        tk.Button(controls, text="停止选中任务", command=self.cancel_selected, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["red"], font=(FONT, 9), padx=12, pady=7).pack(side="left", padx=(8, 0))
+        tk.Button(controls, text="中断选中任务", command=self.cancel_selected, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["red"], font=(FONT, 9), padx=12, pady=7).pack(side="left", padx=(8, 0))
+        tk.Button(controls, text="删除选中任务", command=self.delete_selected_experiment, relief="flat", bd=0, bg="#fff1ef", fg=COLORS["red"], font=(FONT, 9), padx=12, pady=7).pack(side="left", padx=8)
         table_card = self._card(view)
         table_card.pack(fill="both", expand=True)
         toolbar = tk.Frame(table_card, bg=COLORS["surface"])
@@ -1343,7 +1459,7 @@ class DesktopClient(tk.Tk):
 
     def render_activity(self) -> None:
         items = sorted(self.state.get("experiments", []), key=lambda item: safe_int(item.get("created_seq"), 0), reverse=True)[:5]
-        signature = tuple((item.get("id"), item.get("server_id"), item.get("status"), (item.get("assigned_gpu") or {}).get("index"), item.get("priority"), item.get("failure_reason")) for item in items)
+        signature = tuple((item.get("id"), item.get("task_no"), item.get("server_id"), item.get("status"), (item.get("assigned_gpu") or {}).get("index"), item.get("priority"), item.get("failure_reason")) for item in items)
         if signature == self.activity_signature:
             return
         self.activity_signature = signature
@@ -1361,7 +1477,7 @@ class DesktopClient(tk.Tk):
             detail = f"{server_label} · GPU {item['assigned_gpu']['index']} · {item.get('conda_env') or '默认 Python'}" if item.get("assigned_gpu") else f"{server_label} · {item.get('script_name', '')} · 优先级 {item.get('priority')}"
             text_frame = tk.Frame(row, bg=COLORS["surface"])
             text_frame.pack(side="left", fill="x", expand=True)
-            tk.Label(text_frame, text=item.get("name", ""), bg=COLORS["surface"], fg="#3c4c45", font=(FONT, 9, "bold"), anchor="w").pack(fill="x")
+            tk.Label(text_frame, text=f"{task_identifier(item)}  {item.get('name', '')}", bg=COLORS["surface"], fg="#3c4c45", font=(FONT, 9, "bold"), anchor="w").pack(fill="x")
             tk.Label(text_frame, text=detail, bg=COLORS["surface"], fg="#9aa59f", font=(FONT, 8), anchor="w").pack(fill="x", pady=(2, 0))
             tk.Label(row, text=STATUS_LABELS.get(item.get("status"), item.get("status", "")), bg=COLORS["surface"], fg="#819089", font=(FONT, 8)).pack(side="right")
 
@@ -1457,7 +1573,7 @@ class DesktopClient(tk.Tk):
             if self.queue_filter == "all" or (self.queue_filter == "queued" and status in ("queued", "waiting_memory")) or (self.queue_filter == "failed" and status in ("failed", "canceled")) or status == self.queue_filter:
                 visible.append(item)
         visible.sort(key=lambda item: (safe_int(item.get("priority"), 50), safe_int(item.get("created_seq"), 0)))
-        signature = (self.queue_filter, tuple((item.get("id"), item.get("server_id"), item.get("status"), item.get("priority"), item.get("execution_level"), (item.get("assigned_gpu") or {}).get("index"), item.get("peak_memory_mb"), item.get("failure_reason"), item.get("pause_reason")) for item in visible))
+        signature = (self.queue_filter, tuple((item.get("id"), item.get("task_no"), item.get("server_id"), item.get("status"), item.get("priority"), item.get("execution_level"), (item.get("assigned_gpu") or {}).get("index"), item.get("peak_memory_mb"), item.get("failure_reason"), item.get("pause_reason"), item.get("dependency_reason"), tuple(item.get("depends_on") or [])) for item in visible))
         if signature == self.queue_signature:
             return
         self.queue_signature = signature
@@ -1471,7 +1587,13 @@ class DesktopClient(tk.Tk):
             server_name = server_names.get(str(item.get("server_id") or "default"), item.get("server_id") or "默认")
             gpu = f"GPU {item['assigned_gpu'].get('index')} · {item['assigned_gpu'].get('name', '')}" if item.get("assigned_gpu") else "待分配"
             memory = f"{safe_int(item.get('peak_memory_mb')):,} MB" if safe_int(item.get("peak_memory_mb")) else "自动"
-            values = (f"{item.get('name')}  ·  {item.get('script_name')}", server_name, STATUS_LABELS.get(item.get("status"), item.get("status")), f"P{item.get('priority')}", "紧急 · 有显存即跑" if item.get("execution_level") == "emergency" else "默认 · GPU 空闲", gpu, memory)
+            if item.get("dependency_reason"):
+                strategy = "等待前序任务"
+            elif item.get("depends_on"):
+                strategy = "前序完成 · " + "、".join(str(value)[:8] for value in item.get("depends_on")[:2])
+            else:
+                strategy = "紧急 · 有显存即跑" if item.get("execution_level") == "emergency" else "默认 · GPU 空闲"
+            values = (f"{task_identifier(item)}  {item.get('name')}  ·  {item.get('script_name')}", server_name, STATUS_LABELS.get(item.get("status"), item.get("status")), f"P{item.get('priority')}", strategy, gpu, memory)
             if item_id in self.queue_tree.get_children():
                 self.queue_tree.item(item_id, values=values, tags=(item.get("status"),))
             else:
@@ -1676,14 +1798,14 @@ class DesktopClient(tk.Tk):
             return
         if not self.selected_log or not any(item.get("id") == self.selected_log for item in items):
             self.selected_log = items[0].get("id")
-        signature = (self.selected_log, tuple((item.get("id"), item.get("status"), item.get("created_seq"), item.get("name"), item.get("script_name")) for item in items))
+        signature = (self.selected_log, tuple((item.get("id"), item.get("task_no"), item.get("status"), item.get("created_seq"), item.get("name"), item.get("script_name")) for item in items))
         if signature == self.log_signature:
             return
         self.log_signature = signature
         self._clear(self.log_list_body)
         for item in items:
             selected = item.get("id") == self.selected_log
-            button = tk.Button(self.log_list_body, text=f"{item.get('name')}\\n{item.get('script_name')} · {fmt_time(item.get('created_at'))}\\n{STATUS_LABELS.get(item.get('status'), item.get('status'))}", command=lambda exp_id=item.get("id"): self.select_log(exp_id), justify="left", anchor="w", relief="flat", bd=0, bg="#f1f8f4" if selected else COLORS["surface"], fg="#425149", font=(FONT, 9), padx=9, pady=8)
+            button = tk.Button(self.log_list_body, text=f"{task_identifier(item)}  {item.get('name')}\\n{item.get('script_name')} · {fmt_time(item.get('created_at'))}\\n{STATUS_LABELS.get(item.get('status'), item.get('status'))}", command=lambda exp_id=item.get("id"): self.select_log(exp_id), justify="left", anchor="w", relief="flat", bd=0, bg="#f1f8f4" if selected else COLORS["surface"], fg="#425149", font=(FONT, 9), padx=9, pady=8)
             button.pack(fill="x", pady=2)
         self.load_selected_log()
 
@@ -1953,6 +2075,7 @@ class DesktopClient(tk.Tk):
         level_var = tk.StringVar(value=str((experiment or {}).get("execution_level") if editing else "idle_only"))
         memory_var = tk.StringVar(value=str((experiment or {}).get("peak_memory_mb") if editing else (prefs.get("peak_memory_mb") or "")))
         auto_var = tk.BooleanVar(value=bool((experiment or {}).get("auto_retry_oom", True)))
+        initial_dependencies = set(self._normalize_dependency_ids((experiment or {}).get("depends_on", [])))
         server_options = [f"{item.get('name') or item.get('host') or item.get('id')} · {item.get('host') or '未配置'}" for item in self.state.get("servers", [])]
         server_ids = [str(item.get("id")) for item in self.state.get("servers", [])]
         active_server_id = str(self.state.get("active_server_id") or "default")
@@ -1980,6 +2103,76 @@ class DesktopClient(tk.Tk):
         env_combo = ttk.Combobox(dialog, textvariable=env_var, state="readonly", values=["默认 Python"] + envs, width=32)
         env_combo.grid(row=7, column=1, padx=(10, 25), pady=(0, 10))
 
+        row_label(8, "前序任务（可多选）")
+        dependency_frame = tk.Frame(dialog, bg=COLORS["surface"])
+        dependency_frame.grid(row=8, column=1, sticky="ew", padx=(10, 25), pady=(0, 3))
+        dependency_list = tk.Listbox(
+            dependency_frame,
+            height=4,
+            width=35,
+            selectmode=tk.MULTIPLE,
+            exportselection=False,
+            bg=COLORS["surface_soft"],
+            fg=COLORS["ink"],
+            selectbackground=COLORS["mint"],
+            selectforeground=COLORS["green_dark"],
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=COLORS["line"],
+            highlightcolor=COLORS["green"],
+            font=(FONT, 9),
+        )
+        dependency_list.pack(side="left", fill="both", expand=True)
+        dependency_scroll = ttk.Scrollbar(dependency_frame, orient="vertical", command=dependency_list.yview)
+        dependency_scroll.pack(side="right", fill="y")
+        dependency_list.configure(yscrollcommand=dependency_scroll.set)
+        dependency_ids_by_index: list[str] = []
+        dependency_selection = set(initial_dependencies)
+        server_names = {
+            str(item.get("id")): str(item.get("name") or item.get("host") or item.get("id"))
+            for item in self.state.get("servers", [])
+        }
+
+        def refresh_dependency_options() -> None:
+            nonlocal dependency_ids_by_index
+            dependency_ids_by_index = []
+            dependency_list.delete(0, tk.END)
+            candidates = sorted(
+                (
+                    item
+                    for item in self.state.get("experiments", [])
+                    if str(item.get("id")) != str((experiment or {}).get("id"))
+                ),
+                key=lambda item: safe_int(item.get("created_seq"), 0),
+            )
+            for item in candidates:
+                item_id = str(item.get("id"))
+                dependency_ids_by_index.append(item_id)
+                server_name = server_names.get(str(item.get("server_id") or "default"), "默认服务器")
+                status = STATUS_LABELS.get(item.get("status"), item.get("status") or "等待调度")
+                dependency_list.insert(tk.END, f"{task_identifier(item)} · {item.get('name') or item_id} · {server_name} · {status}")
+            for index, item_id in enumerate(dependency_ids_by_index):
+                if item_id in dependency_selection:
+                    dependency_list.selection_set(index)
+            if candidates:
+                dependency_hint.configure(text="默认无前序；可按 Ctrl/Shift 多选已有任务。")
+            else:
+                dependency_hint.configure(text="暂无可选任务，默认无前序任务。")
+
+        dependency_hint = tk.Label(dialog, text="", bg=COLORS["surface"], fg="#9aa7a0", font=(FONT, 8))
+        dependency_hint.grid(row=9, column=1, sticky="w", padx=(10, 25), pady=(0, 8))
+        def remember_dependencies(_event: Any = None) -> None:
+            dependency_selection.clear()
+            dependency_selection.update(
+                dependency_ids_by_index[index]
+                for index in dependency_list.curselection()
+                if index < len(dependency_ids_by_index)
+            )
+
+        dependency_list.bind("<<ListboxSelect>>", remember_dependencies)
+        refresh_dependency_options()
+
         def apply_server_defaults(_event: Any = None) -> None:
             selected_id = server_ids[server_options.index(server_var.get())] if server_var.get() in server_options else active_server_id
             selected_state = self.state.get("server_states", {}).get(selected_id, {})
@@ -2003,16 +2196,16 @@ class DesktopClient(tk.Tk):
         apply_server_defaults()
         if env_var.get() not in envs and env_var.get() != "默认 Python":
             env_var.set("默认 Python")
-        row_label(8, "优先级（越小越先）")
-        self._spinbox(dialog, textvariable=priority_var, from_=1, to=999, width=33).grid(row=8, column=1, padx=(10, 25), pady=(0, 10))
-        row_label(9, "执行级别")
-        ttk.Combobox(dialog, textvariable=level_var, state="readonly", values=("idle_only", "emergency"), width=32).grid(row=9, column=1, padx=(10, 25), pady=(0, 10))
-        row_label(10, "峰值显存（MB）")
-        self._entry(dialog, textvariable=memory_var, width=35).grid(row=10, column=1, padx=(10, 25), pady=(0, 4))
-        tk.Label(dialog, text="填 0 或留空 = 自动学习；OOM 后自动提高门槛。", bg=COLORS["surface"], fg="#9aa7a0", font=(FONT, 8)).grid(row=11, column=1, sticky="w", padx=(10, 25), pady=(0, 8))
-        self._checkbutton(dialog, text="显存不足后自动等待重试", variable=auto_var).grid(row=12, column=0, columnspan=2, sticky="w", padx=25, pady=(0, 8))
+        row_label(10, "优先级（越小越先）")
+        self._spinbox(dialog, textvariable=priority_var, from_=1, to=999, width=33).grid(row=10, column=1, padx=(10, 25), pady=(0, 10))
+        row_label(11, "执行级别")
+        ttk.Combobox(dialog, textvariable=level_var, state="readonly", values=("idle_only", "emergency"), width=32).grid(row=11, column=1, padx=(10, 25), pady=(0, 10))
+        row_label(12, "峰值显存（MB）")
+        self._entry(dialog, textvariable=memory_var, width=35).grid(row=12, column=1, padx=(10, 25), pady=(0, 4))
+        tk.Label(dialog, text="填 0 或留空 = 自动学习；OOM 后自动提高门槛。", bg=COLORS["surface"], fg="#9aa7a0", font=(FONT, 8)).grid(row=13, column=1, sticky="w", padx=(10, 25), pady=(0, 8))
+        self._checkbutton(dialog, text="显存不足后自动等待重试", variable=auto_var).grid(row=14, column=0, columnspan=2, sticky="w", padx=25, pady=(0, 8))
         buttons = tk.Frame(dialog, bg=COLORS["surface"])
-        buttons.grid(row=13, column=0, columnspan=2, sticky="e", padx=25, pady=18)
+        buttons.grid(row=15, column=0, columnspan=2, sticky="e", padx=25, pady=18)
         tk.Button(buttons, text="取消", command=dialog.destroy, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["muted"], font=(FONT, 9), padx=10, pady=7).pack(side="left", padx=5)
         submit = tk.Button(buttons, text="保存并重新等待  →" if editing else "加入队列  →", relief="flat", bd=0, bg=COLORS["green"], fg="#ffffff", font=(FONT, 9, "bold"), padx=13, pady=7)
         submit.pack(side="left", padx=5)
@@ -2025,12 +2218,18 @@ class DesktopClient(tk.Tk):
             name = clean_name(name_var.get(), Path(script).stem)
             level = level_var.get() if level_var.get() in ("idle_only", "emergency") else "idle_only"
             env = "" if env_var.get() == "默认 Python" else env_var.get()
+            remember_dependencies()
+            depends_on = [
+                dependency_ids_by_index[index]
+                for index in dependency_list.curselection()
+                if index < len(dependency_ids_by_index)
+            ]
             selected_server_id = server_ids[server_options.index(server_var.get())] if server_var.get() in server_options else active_server_id
             try:
                 if editing:
-                    self.update_experiment(experiment["id"], name, script, workdir_var.get().strip(), env, safe_int(priority_var.get(), 50), level, max(0, safe_int(memory_var.get(), 0)), auto_var.get())
+                    self.update_experiment(experiment["id"], name, script, workdir_var.get().strip(), env, safe_int(priority_var.get(), 50), level, max(0, safe_int(memory_var.get(), 0)), auto_var.get(), depends_on)
                 else:
-                    self.add_experiment(selected_server_id, name, script, workdir_var.get().strip(), env, safe_int(priority_var.get(), 50), level, max(0, safe_int(memory_var.get(), 0)), auto_var.get())
+                    self.add_experiment(selected_server_id, name, script, workdir_var.get().strip(), env, safe_int(priority_var.get(), 50), level, max(0, safe_int(memory_var.get(), 0)), auto_var.get(), depends_on)
                 dialog.destroy()
                 self.set_status("实验配置已更新并重新进入等待队列" if editing else "实验已加入队列")
             except Exception as exc:
@@ -2044,7 +2243,56 @@ class DesktopClient(tk.Tk):
             variable.set(path)
             label.configure(text=Path(path).name)
 
-    def update_experiment(self, exp_id: str, name: str, script: str, workdir: str, env: str, priority: int, level: str, peak: int, auto_retry: bool) -> None:
+    def _normalize_dependency_ids(self, values: Any) -> list[str]:
+        if isinstance(values, str):
+            values = [values]
+        if not isinstance(values, (list, tuple, set)):
+            return []
+        result: list[str] = []
+        for value in values:
+            value = str(value or "").strip()
+            if value and value not in result:
+                result.append(value)
+        return result
+
+    def _validate_dependency_ids(self, exp_id: str, dependency_ids: list[str]) -> None:
+        with self.manager.store.lock:
+            records = {
+                str(item.get("id")): item
+                for item in self.manager.store.data.get("experiments", [])
+                if item.get("id")
+            }
+            missing = [dependency_id for dependency_id in dependency_ids if dependency_id not in records and dependency_id != exp_id]
+            if missing:
+                raise ValueError(f"前序任务不存在：{', '.join(missing)}")
+            graph = {
+                item_id: set(self._normalize_dependency_ids(item.get("depends_on", [])))
+                for item_id, item in records.items()
+            }
+            graph[exp_id] = set(dependency_ids)
+        if exp_id in dependency_ids:
+            raise ValueError("任务不能把自己设置为前序任务")
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def has_cycle(node: str) -> bool:
+            if node in visiting:
+                return True
+            if node in visited:
+                return False
+            visiting.add(node)
+            if any(has_cycle(dependency_id) for dependency_id in graph.get(node, set())):
+                return True
+            visiting.remove(node)
+            visited.add(node)
+            return False
+
+        if has_cycle(exp_id):
+            raise ValueError("前序任务不能形成循环依赖")
+
+    def update_experiment(self, exp_id: str, name: str, script: str, workdir: str, env: str, priority: int, level: str, peak: int, auto_retry: bool, depends_on: list[str] | None = None) -> None:
+        depends_on = self._normalize_dependency_ids(depends_on or [])
+        self._validate_dependency_ids(exp_id, depends_on)
         with self.manager.store.lock:
             stored = next((item for item in self.manager.store.data.get("experiments", []) if item.get("id") == exp_id), None)
             if stored is None:
@@ -2093,6 +2341,8 @@ class DesktopClient(tk.Tk):
                 "peak_memory_mb": max(0, peak),
                 "auto_peak_memory_mb": 0,
                 "auto_retry_oom": auto_retry,
+                "depends_on": depends_on,
+                "dependency_reason": "",
                 "status": new_status,
                 "pause_reason": pause_reason,
                 "paused_process": False,
@@ -2111,9 +2361,11 @@ class DesktopClient(tk.Tk):
         if target_runtime.connected and new_status == "queued":
             self._tick_in_background()
 
-    def add_experiment(self, server_id: str, name: str, script: str, workdir: str, env: str, priority: int, level: str, peak: int, auto_retry: bool) -> None:
+    def add_experiment(self, server_id: str, name: str, script: str, workdir: str, env: str, priority: int, level: str, peak: int, auto_retry: bool, depends_on: list[str] | None = None) -> None:
         UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
         exp_id = uuid.uuid4().hex[:12]
+        depends_on = self._normalize_dependency_ids(depends_on or [])
+        self._validate_dependency_ids(exp_id, depends_on)
         local_script = UPLOAD_DIR / f"{exp_id}.sh"
         shutil.copy2(script, local_script)
         target_server_id = server_id or "default"
@@ -2122,6 +2374,8 @@ class DesktopClient(tk.Tk):
             data = self.manager.store.data
             experiments = data.setdefault("experiments", [])
             sequence = max([safe_int(item.get("created_seq"), 0) for item in experiments] or [0]) + 1
+            task_no = max(safe_int(data.get("next_experiment_no"), 1), 1)
+            data["next_experiment_no"] = task_no + 1
             record = next((item for item in data.setdefault("servers", []) if item.get("id") == target_server_id), None)
             disk_guard = target_runtime.disk_guard or {}
             if record and record.get("scheduler_paused"):
@@ -2135,6 +2389,7 @@ class DesktopClient(tk.Tk):
                 pause_reason = ""
             experiments.append({
                 "id": exp_id,
+                "task_no": task_no,
                 "server_id": target_server_id,
                 "name": name,
                 "script_name": Path(script).name,
@@ -2146,6 +2401,8 @@ class DesktopClient(tk.Tk):
                 "peak_memory_mb": max(0, peak),
                 "auto_peak_memory_mb": 0,
                 "auto_retry_oom": auto_retry,
+                "depends_on": depends_on,
+                "dependency_reason": "",
                 "status": initial_status,
                 "pause_reason": pause_reason,
                 "paused_process": False,
@@ -2179,6 +2436,33 @@ class DesktopClient(tk.Tk):
             return
         self.open_experiment_dialog(item)
 
+    def delete_selected_experiment(self) -> None:
+        item = self._selected_item()
+        if not item:
+            self.set_status("请先选择一个实验任务", True)
+            return
+        if item.get("status") == "running" or item.get("paused_process"):
+            self.set_status("正在执行或已暂停进程的任务不能直接删除，请先中断任务", True)
+            return
+        task_name = f"{task_identifier(item)}  {item.get('name') or item.get('script_name') or '实验任务'}"
+        confirmed = messagebox.askyesno(
+            "删除实验任务",
+            f"确定删除 {task_name} 吗？\n\n本地任务记录和脚本缓存会删除，服务器上的历史日志会保留。",
+            parent=self,
+        )
+        if not confirmed:
+            return
+        exp_id = str(item.get("id"))
+
+        def action() -> None:
+            self.manager.delete_experiment(exp_id)
+            if self.selected_log == exp_id:
+                self.selected_log = None
+            self.queue_signature = None
+            self.log_signature = None
+
+        self._run_queue_action(action, "实验任务已删除")
+
     def retry_selected(self) -> None:
         item = self._selected_item()
         if not item:
@@ -2193,7 +2477,7 @@ class DesktopClient(tk.Tk):
                 self.set_status("当前任务状态不能重试", True)
                 return
             if stored:
-                stored.update({"status": "queued", "failure_reason": "", "validation_error": "", "finished_at": "", "pause_reason": "", "paused_process": False, "assigned_gpu": None, "pid": 0, "process_group_id": 0})
+                stored.update({"status": "queued", "failure_reason": "", "validation_error": "", "dependency_reason": "", "finished_at": "", "pause_reason": "", "paused_process": False, "assigned_gpu": None, "pid": 0, "process_group_id": 0})
                 self.manager.store.save()
         self._tick_in_background()
         self.set_status("实验已重新加入队列")
@@ -2212,17 +2496,14 @@ class DesktopClient(tk.Tk):
                     return
                 status = stored.get("status")
             if status in ("running", "paused"):
-                try:
-                    self.manager.terminate_experiment(exp_id)
-                except Exception:
-                    pass
+                self.manager.terminate_experiment(exp_id)
             with self.manager.store.lock:
                 stored = next((exp for exp in self.manager.store.data.get("experiments", []) if exp.get("id") == exp_id), None)
                 if stored and stored.get("status") in ("queued", "waiting_memory", "running", "paused"):
                     stored.update({"status": "canceled", "finished_at": now_iso(), "failure_reason": "已取消", "pause_reason": "", "paused_process": False})
                     self.manager.store.save()
 
-        self._run_queue_action(action, "已发送停止请求")
+        self._run_queue_action(action, "任务已中断")
 
     def run_benchmark(self, server_id: str, gpu_index: int, conda_env: str = "") -> None:
         key = (server_id or "default", gpu_index)

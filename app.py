@@ -103,6 +103,7 @@ class StateStore:
                 "execution_level": "idle_only",
             },
             "experiments": [],
+            "next_experiment_no": 1,
             "benchmark_history": [],
             "last_snapshot": None,
             "server_snapshots": {},
@@ -687,6 +688,46 @@ PY
     def _experiment(self, exp_id: str) -> dict[str, Any] | None:
         return next((item for item in self._server_experiments() if item.get("id") == exp_id), None)
 
+    def _dependency_ids(self, exp: dict[str, Any]) -> list[str]:
+        raw = exp.get("depends_on", [])
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, (list, tuple, set)):
+            return []
+        result: list[str] = []
+        for value in raw:
+            value = str(value or "").strip()
+            if value and value not in result:
+                result.append(value)
+        return result
+
+    def _dependencies_ready(self, exp: dict[str, Any]) -> tuple[bool, str]:
+        dependency_ids = self._dependency_ids(exp)
+        if not dependency_ids:
+            return True, ""
+        records = {str(item.get("id")): item for item in self.store.data.get("experiments", []) if item.get("id")}
+        waiting: list[str] = []
+        blocked: list[str] = []
+        for dependency_id in dependency_ids:
+            dependency = records.get(dependency_id)
+            if dependency is None:
+                blocked.append(f"任务 {dependency_id} 不存在")
+                continue
+            status = str(dependency.get("status") or "queued")
+            name = str(dependency.get("name") or dependency_id)
+            if status == "success":
+                continue
+            if status in ("failed", "canceled"):
+                status_label = {"failed": "执行失败", "canceled": "已取消"}.get(status, status)
+                blocked.append(f"{name}（{status_label}）")
+            else:
+                waiting.append(name)
+        if blocked:
+            return False, "前序任务未成功完成：" + "、".join(blocked[:3])
+        if waiting:
+            return False, "等待前序任务完成：" + "、".join(waiting[:3])
+        return True, ""
+
     def _signal_process(self, exp: dict[str, Any], signal_name: str) -> None:
         pid = safe_int(exp.get("pid"), 0)
         process_group_id = safe_int(exp.get("process_group_id"), 0) or pid
@@ -783,8 +824,23 @@ PY
             exp = self._experiment(exp_id)
             if not exp or exp.get("status") not in ("running", "paused"):
                 return
-            if safe_int(exp.get("pid"), 0):
-                self._signal_process(exp, "TERM")
+            pid = safe_int(exp.get("pid"), 0)
+            if not pid:
+                return
+            process_group_id = safe_int(exp.get("process_group_id"), 0) or pid
+            # _start() launches each experiment with setsid, so the recorded
+            # PID is also the root of an isolated process group/session. Stop
+            # the whole group, then force-kill it if children ignore TERM.
+            command = (
+                f"if kill -TERM -- -{process_group_id} >/dev/null 2>&1; then :; "
+                f"else kill -TERM {pid} >/dev/null 2>&1 || true; fi; "
+                f"for attempt in 1 2 3 4 5; do "
+                f"if kill -0 -- -{process_group_id} >/dev/null 2>&1 || kill -0 {pid} >/dev/null 2>&1; "
+                f"then sleep 1; else exit 0; fi; done; "
+                f"kill -KILL -- -{process_group_id} >/dev/null 2>&1 || "
+                f"kill -KILL {pid} >/dev/null 2>&1 || true"
+            )
+            self.remote.exec(command, timeout=15)
 
     def _schedule(self) -> None:
         if not self.connected or not self.snapshot or self._scheduler_blocked():
@@ -796,6 +852,11 @@ PY
         ]
         candidates.sort(key=self._sort_key)
         for exp in candidates:
+            dependencies_ready, dependency_reason = self._dependencies_ready(exp)
+            if not dependencies_ready:
+                exp["dependency_reason"] = dependency_reason
+                continue
+            exp["dependency_reason"] = ""
             env = str(exp.get("conda_env", "")).strip()
             if env and env not in self.conda_info.get("envs", []):
                 exp["validation_error"] = f"找不到 Conda 环境：{env}"
@@ -969,8 +1030,11 @@ def api_create_experiment():
     priority = max(1, min(999, safe_int(request.form.get("priority"), 50)))
     name = clean_name(request.form.get("name", ""), Path(upload.filename).stem)
     seq = max([safe_int(item.get("created_seq"), 0) for item in store.data.get("experiments", [])] or [0]) + 1
+    task_no = max(safe_int(store.data.get("next_experiment_no"), 1), 1)
+    store.data["next_experiment_no"] = task_no + 1
     experiment = {
         "id": exp_id,
+        "task_no": task_no,
         "name": name,
         "script_name": upload.filename,
         "local_script": str(local_script),
@@ -981,6 +1045,8 @@ def api_create_experiment():
         "peak_memory_mb": peak,
         "auto_peak_memory_mb": 0,
         "auto_retry_oom": request.form.get("auto_retry_oom") == "true",
+        "depends_on": [],
+        "dependency_reason": "",
         "status": "queued",
         "created_at": now_iso(),
         "created_seq": seq,

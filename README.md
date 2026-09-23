@@ -10,6 +10,8 @@
 - 资源总览支持多服务器同时展示和滚动浏览；显卡卡片显示显存百分比，点击卡片可查看具体可用显存、进程、显存占用和运行时长。
 - 基于 PyTorch CUDA 矩阵乘法的 FP16 Tensor 与 FP32 实测 TFLOPS；结果保存在本地状态文件。
 - .sh 上传、工作目录、Conda 环境下拉选择、优先级、默认/紧急执行级别、峰值显存门槛。
+- 每个实验可选择一个或多个前序任务；默认无前序，只有所有前序任务成功完成后才会进入 GPU 调度。
+- 每个实验都有不会复用的任务序号，支持删除未运行且未被其他任务依赖的历史任务；运行中的任务可从面板中断整个进程组。
 - 调度规则：优先级数字越小越优先；同优先级按提交顺序；GPU 按 Tensor 基准速度优先；默认级别只使用满足显存条件的空闲 GPU，紧急级别也优先使用空闲 GPU，只有没有合适空闲卡时才共享忙卡。
 - 远程日志统一放在 ~/.gpu-orchestrator/runs/<experiment-id>/run.log，界面可实时查看和停止任务。
 - GPU 测试开始时会自动把最新 remote_agent.py 上传到目标服务器再执行；实验脚本在被调度到目标服务器时上传到对应的 runs/<experiment-id>/run.sh。
@@ -37,6 +39,7 @@ Windows 也可以双击 start_client.bat。它会直接打开原生客户端窗�
 - 本地配置、实验状态和测试历史：data/state.json
 - 本地待上传脚本缓存：data/uploads/
 - 远程探针、运行副本和日志：~/.gpu-orchestrator/
+- 客户端 Logo 与 Windows 图标：assets/gpu_orchestrator_logo.png、assets/gpu_orchestrator.ico
 
 ## 调度说明
 
