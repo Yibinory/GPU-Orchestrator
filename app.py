@@ -5,7 +5,9 @@ import json
 import os
 import re
 import shlex
+import shutil
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -968,6 +970,701 @@ store = StateStore(STATE_FILE)
 runtime = Runtime(store)
 
 
+class RuntimeManager:
+    """Owns one Runtime worker per configured server for the web UI."""
+
+    def __init__(self, store_ref: StateStore) -> None:
+        self.store = store_ref
+        self.runtimes: dict[str, Runtime] = {"default": runtime}
+        self._ensure_server_config()
+        self._ensure_experiment_numbers()
+        self._sync_runtimes()
+
+    def _ensure_server_config(self) -> None:
+        data = self.store.data
+        servers = data.setdefault("servers", [])
+        changed = False
+        default_record = next((item for item in servers if item.get("id") == "default"), None)
+        if default_record is None:
+            profile = dict(data.get("profile", {}))
+            default_record = {
+                "id": "default",
+                "name": profile.get("host") or "默认服务器",
+                "profile": profile,
+                "preferences": dict(data.get("preferences", {})),
+                "auto_connect": bool(profile.get("host") and profile.get("username")),
+                "enabled": True,
+            }
+            servers.insert(0, default_record)
+            changed = True
+        if not default_record.get("_auto_connect_configured"):
+            profile = default_record.get("profile") or data.get("profile") or {}
+            default_record["auto_connect"] = bool(profile.get("host") and profile.get("username"))
+            default_record["_auto_connect_configured"] = True
+            changed = True
+        for record in servers:
+            if "enabled" not in record:
+                record["enabled"] = True
+                changed = True
+            if "scheduler_paused" not in record:
+                record["scheduler_paused"] = False
+                changed = True
+            if "scheduler_pause_reason" not in record:
+                record["scheduler_pause_reason"] = ""
+                changed = True
+        for experiment in data.setdefault("experiments", []):
+            if not experiment.get("server_id"):
+                experiment["server_id"] = "default"
+                changed = True
+        active = data.get("active_server_id")
+        if not active or not any(item.get("id") == active for item in servers):
+            data["active_server_id"] = servers[0].get("id", "default")
+            changed = True
+        if changed:
+            self.store.save()
+
+    def _ensure_experiment_numbers(self) -> None:
+        """Migrate old tasks and keep a never-reused human-facing task number."""
+        data = self.store.data
+        experiments = data.setdefault("experiments", [])
+        highest = max(
+            [safe_int(item.get("task_no"), safe_int(item.get("created_seq"), 0)) for item in experiments]
+            or [0]
+        )
+        next_number = max(safe_int(data.get("next_experiment_no"), 1), highest + 1, 1)
+        used: set[int] = set()
+        changed = False
+        for item in experiments:
+            number = safe_int(item.get("task_no"), 0)
+            if number <= 0 or number in used:
+                legacy_number = safe_int(item.get("created_seq"), 0)
+                number = legacy_number if legacy_number > 0 and legacy_number not in used else next_number
+            used.add(number)
+            next_number = max(next_number, number + 1)
+            if item.get("task_no") != number:
+                item["task_no"] = number
+                changed = True
+        if safe_int(data.get("next_experiment_no"), 0) != next_number:
+            data["next_experiment_no"] = next_number
+            changed = True
+        if changed:
+            self.store.save()
+
+    def _sync_runtimes(self) -> None:
+        for record in self.store.data.get("servers", []):
+            server_id = str(record.get("id"))
+            if server_id and server_id not in self.runtimes:
+                self.runtimes[server_id] = Runtime(self.store, server_id)
+
+    @property
+    def active_server_id(self) -> str:
+        return str(self.store.data.get("active_server_id") or "default")
+
+    def runtime_for(self, server_id: str | None) -> Runtime:
+        self._sync_runtimes()
+        return self.runtimes.get(server_id or "default", runtime)
+
+    def _visible_experiments(self) -> list[dict[str, Any]]:
+        return [
+            {key: value for key, value in item.items() if key != "local_script"}
+            for item in self.store.data.get("experiments", [])
+        ]
+
+    def public_state(self) -> dict[str, Any]:
+        self._sync_runtimes()
+        active_state = self.runtime_for(self.active_server_id).public_state()
+        servers = []
+        server_states: dict[str, dict[str, Any]] = {}
+        for record in self.store.data.get("servers", []):
+            server_id = str(record.get("id"))
+            state = self.runtime_for(server_id).public_state()
+            profile = state.get("profile") or {}
+            servers.append(
+                {
+                    "id": server_id,
+                    "name": record.get("name") or profile.get("host") or server_id,
+                    "host": profile.get("host", ""),
+                    "port": profile.get("port", 22),
+                    "username": profile.get("username", ""),
+                    "home": profile.get("home", ""),
+                    "connected": bool(record.get("enabled", True) and state.get("connected", False)),
+                    "enabled": bool(record.get("enabled", True)),
+                    "auto_connect": bool(record.get("auto_connect")),
+                    "last_error": state.get("last_error", ""),
+                    "last_poll_at": state.get("last_poll_at", ""),
+                    "scheduler_paused": bool(state.get("scheduler_paused")),
+                    "scheduler_pause_reason": state.get("scheduler_pause_reason", ""),
+                    "disk_blocked": bool((state.get("disk_guard") or {}).get("blocked")),
+                }
+            )
+            server_states[server_id] = state
+        active_state["experiments"] = self._visible_experiments()
+        active_state["benchmark_history"] = sorted(
+            self.store.data.get("benchmark_history", []), key=lambda item: item.get("created_at", "")
+        )[-48:]
+        active_state["servers"] = servers
+        active_state["server_states"] = server_states
+        active_state["active_server_id"] = self.active_server_id
+        active_record = next(
+            (item for item in self.store.data.get("servers", []) if item.get("id") == self.active_server_id), {}
+        )
+        active_state["connected"] = bool(
+            active_record.get("enabled", True) and active_state.get("connected", False)
+        )
+        return active_state
+
+    def set_active(self, server_id: str) -> None:
+        if not any(item.get("id") == server_id for item in self.store.data.get("servers", [])):
+            raise ValueError("服务器不存在")
+        self.store.data["active_server_id"] = server_id
+        self.store.save()
+
+    def upsert_server(self, server_id: str | None, name: str, profile: dict[str, Any], auto_connect: bool) -> str:
+        self._sync_runtimes()
+        server_id = server_id or f"server-{uuid.uuid4().hex[:8]}"
+        record = next(
+            (item for item in self.store.data.setdefault("servers", []) if item.get("id") == server_id), None
+        )
+        if record is None:
+            record = {"id": server_id}
+            self.store.data["servers"].append(record)
+        record.update(
+            {
+                "name": name or profile.get("host") or server_id,
+                "profile": dict(profile),
+                "auto_connect": bool(auto_connect),
+                "_auto_connect_configured": True,
+            }
+        )
+        record.setdefault("enabled", True)
+        record.setdefault("preferences", {})
+        record.setdefault("scheduler_paused", False)
+        record.setdefault("scheduler_pause_reason", "")
+        self.store.data["active_server_id"] = server_id
+        self.store.save()
+        self._sync_runtimes()
+        return server_id
+
+    def remove_server(self, server_id: str) -> None:
+        if server_id == "default":
+            raise ValueError("默认服务器不能删除")
+        rt = self.runtime_for(server_id)
+        if any(
+            item.get("server_id") == server_id and item.get("status") == "running"
+            for item in self.store.data.get("experiments", [])
+        ):
+            raise ValueError("该服务器还有运行中的实验，不能删除")
+        rt.disconnect()
+        # The runtime's poll loop calls _server_record() every iteration,
+        # which would re-create the deleted record. Stop it before removing.
+        rt.stop_event.set()
+        self.runtimes.pop(server_id, None)
+        self.store.data["servers"] = [
+            item for item in self.store.data.get("servers", []) if item.get("id") != server_id
+        ]
+        self.store.data["active_server_id"] = "default"
+        self.store.save()
+
+    def set_enabled(self, server_id: str, enabled: bool) -> None:
+        record = next(
+            (item for item in self.store.data.get("servers", []) if item.get("id") == server_id), None
+        )
+        if record is None:
+            raise ValueError("服务器不存在")
+        record["enabled"] = bool(enabled)
+        self.store.save()
+        if enabled:
+            self.auto_connect()
+        else:
+            self.runtime_for(server_id).disconnect()
+
+    def set_scheduler_paused(self, server_id: str, paused: bool) -> None:
+        record = next(
+            (item for item in self.store.data.get("servers", []) if item.get("id") == server_id), None
+        )
+        if record is None:
+            raise ValueError("服务器不存在")
+        record["scheduler_paused"] = bool(paused)
+        record["scheduler_pause_reason"] = "用户手动暂停调度" if paused else ""
+        self.store.save()
+
+    def _experiment_record(self, exp_id: str) -> dict[str, Any] | None:
+        return next(
+            (item for item in self.store.data.get("experiments", []) if item.get("id") == exp_id), None
+        )
+
+    def set_experiment_paused(self, exp_id: str, paused: bool) -> None:
+        with self.store.lock:
+            stored = self._experiment_record(exp_id)
+            if stored is None:
+                raise ValueError("实验不存在")
+            server_id = str(stored.get("server_id") or "default")
+            status = stored.get("status")
+        target = self.runtime_for(server_id)
+        if paused:
+            if status == "paused":
+                return
+            if status not in ("queued", "waiting_memory", "running"):
+                raise ValueError("只有等待中或执行中的任务可以暂停")
+            target.pause_experiment(exp_id)
+        else:
+            if status != "paused":
+                return
+            target.resume_experiment(exp_id)
+
+    def pause_all_experiments(self) -> None:
+        with self.store.lock:
+            task_ids = [
+                str(item.get("id"))
+                for item in self.store.data.get("experiments", [])
+                if item.get("status") in ("queued", "waiting_memory", "running")
+            ]
+            for record in self.store.data.get("servers", []):
+                record["scheduler_paused"] = True
+                record["scheduler_pause_reason"] = "用户手动暂停全部任务"
+            self.store.save()
+        errors: list[str] = []
+        for exp_id in task_ids:
+            try:
+                self.set_experiment_paused(exp_id, True)
+            except Exception as exc:
+                errors.append(f"{exp_id}: {exc}")
+        if errors:
+            raise RuntimeError("；".join(errors))
+
+    def resume_all_experiments(self) -> None:
+        with self.store.lock:
+            task_ids = [
+                str(item.get("id"))
+                for item in self.store.data.get("experiments", [])
+                if item.get("status") == "paused"
+            ]
+            for record in self.store.data.get("servers", []):
+                record["scheduler_paused"] = False
+                record["scheduler_pause_reason"] = ""
+            self.store.save()
+        errors: list[str] = []
+        for exp_id in task_ids:
+            try:
+                with self.store.lock:
+                    stored = self._experiment_record(exp_id)
+                    server_id = str((stored or {}).get("server_id") or "default")
+                    paused_process = bool((stored or {}).get("paused_process"))
+                target = self.runtime_for(server_id)
+                if paused_process:
+                    target.requeue_experiment(exp_id)
+                else:
+                    target.resume_experiment(exp_id)
+            except Exception as exc:
+                errors.append(f"{exp_id}: {exc}")
+        if errors:
+            raise RuntimeError("；".join(errors))
+
+    def terminate_experiment(self, exp_id: str) -> None:
+        with self.store.lock:
+            stored = self._experiment_record(exp_id)
+            if stored is None:
+                raise ValueError("实验不存在")
+            server_id = str(stored.get("server_id") or "default")
+        self.runtime_for(server_id).terminate_experiment(exp_id)
+
+    def delete_experiment(self, exp_id: str) -> None:
+        local_script: Path | None = None
+        with self.store.lock:
+            stored = self._experiment_record(exp_id)
+            if stored is None:
+                raise ValueError("实验不存在")
+            if stored.get("status") == "running" or stored.get("paused_process"):
+                raise ValueError("正在执行或已暂停进程的任务不能直接删除，请先中断任务")
+            dependents = [
+                item
+                for item in self.store.data.get("experiments", [])
+                if exp_id in [str(value) for value in (item.get("depends_on") or [])]
+            ]
+            if dependents:
+                labels = []
+                for item in dependents[:3]:
+                    task_no = safe_int(item.get("task_no"), 0)
+                    labels.append(
+                        f"#{task_no:04d} {item.get('name') or item.get('id')}"
+                        if task_no
+                        else str(item.get("name") or item.get("id"))
+                    )
+                raise ValueError("仍有任务依赖它：" + "、".join(labels))
+            raw_script = str(stored.get("local_script") or "").strip()
+            if raw_script:
+                local_script = Path(raw_script)
+            self.store.data["experiments"] = [
+                item for item in self.store.data.get("experiments", []) if str(item.get("id")) != exp_id
+            ]
+            self.store.save()
+        if local_script is not None:
+            try:
+                upload_root = UPLOAD_DIR.resolve()
+                candidate = local_script.resolve()
+                candidate.relative_to(upload_root)
+                candidate.unlink(missing_ok=True)
+            except (OSError, ValueError):
+                pass
+
+    def retry_experiment(self, exp_id: str) -> None:
+        with self.store.lock:
+            stored = self._experiment_record(exp_id)
+            if stored is None:
+                raise ValueError("实验不存在")
+            if stored.get("status") == "running" or (
+                stored.get("status") == "paused" and stored.get("paused_process")
+            ):
+                raise ValueError("执行中的任务请先恢复或停止，不能直接重试")
+            if stored.get("status") not in ("success", "failed", "canceled", "paused", "queued", "waiting_memory"):
+                raise ValueError("当前任务状态不能重试")
+            server_id = str(stored.get("server_id") or "default")
+            stored.update(
+                {
+                    "status": "queued",
+                    "failure_reason": "",
+                    "validation_error": "",
+                    "dependency_reason": "",
+                    "finished_at": "",
+                    "pause_reason": "",
+                    "paused_process": False,
+                    "assigned_gpu": None,
+                    "pid": 0,
+                    "process_group_id": 0,
+                }
+            )
+            self.store.save()
+        target = self.runtime_for(server_id)
+        if target.connected:
+            threading.Thread(target=target.tick, daemon=True).start()
+
+    def cancel_experiment(self, exp_id: str) -> None:
+        with self.store.lock:
+            stored = self._experiment_record(exp_id)
+            if stored is None:
+                raise ValueError("实验不存在")
+            server_id = str(stored.get("server_id") or "default")
+            status = stored.get("status")
+        if status in ("running", "paused"):
+            try:
+                self.terminate_experiment(exp_id)
+            except Exception:
+                pass
+        with self.store.lock:
+            stored = self._experiment_record(exp_id)
+            if stored and stored.get("status") in ("queued", "waiting_memory", "running", "paused"):
+                stored.update(
+                    {
+                        "status": "canceled",
+                        "finished_at": now_iso(),
+                        "failure_reason": "已取消",
+                        "pause_reason": "",
+                        "paused_process": False,
+                    }
+                )
+                self.store.save()
+
+    def requeue_experiment(self, exp_id: str) -> None:
+        with self.store.lock:
+            stored = self._experiment_record(exp_id)
+            if stored is None:
+                raise ValueError("实验不存在")
+            if stored.get("status") != "paused":
+                raise ValueError("只有暂停中的任务可以重新等待")
+            server_id = str(stored.get("server_id") or "default")
+        self.runtime_for(server_id).requeue_experiment(exp_id)
+
+    @staticmethod
+    def _normalize_dependency_ids(values: Any) -> list[str]:
+        if isinstance(values, str):
+            values = [values]
+        if not isinstance(values, (list, tuple, set)):
+            return []
+        result: list[str] = []
+        for value in values:
+            value = str(value or "").strip()
+            if value and value not in result:
+                result.append(value)
+        return result
+
+    def _validate_dependency_ids(self, exp_id: str, dependency_ids: list[str]) -> None:
+        if exp_id in dependency_ids:
+            raise ValueError("任务不能把自己设置为前序任务")
+        with self.store.lock:
+            records = {
+                str(item.get("id")): item
+                for item in self.store.data.get("experiments", [])
+                if item.get("id")
+            }
+            missing = [dependency_id for dependency_id in dependency_ids if dependency_id not in records]
+            if missing:
+                raise ValueError(f"前序任务不存在：{', '.join(missing)}")
+            graph = {
+                item_id: set(self._normalize_dependency_ids(item.get("depends_on", [])))
+                for item_id, item in records.items()
+            }
+            graph[exp_id] = set(dependency_ids)
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def has_cycle(node: str) -> bool:
+            if node in visiting:
+                return True
+            if node in visited:
+                return False
+            visiting.add(node)
+            if any(has_cycle(dependency_id) for dependency_id in graph.get(node, set())):
+                return True
+            visiting.remove(node)
+            visited.add(node)
+            return False
+
+        if has_cycle(exp_id):
+            raise ValueError("前序任务不能形成循环依赖")
+
+    def _initial_queue_status(self, server_id: str, target_runtime: Runtime) -> tuple[str, str]:
+        record = next(
+            (item for item in self.store.data.get("servers", []) if item.get("id") == server_id), None
+        )
+        disk_guard = target_runtime.disk_guard or {}
+        if record and record.get("scheduler_paused"):
+            return "paused", record.get("scheduler_pause_reason") or "该服务器调度已暂停"
+        if disk_guard.get("blocked"):
+            return "paused", disk_guard.get("message") or "磁盘可用空间不足，已暂停调度"
+        return "queued", ""
+
+    def add_experiment(
+        self,
+        server_id: str,
+        name: str,
+        script_src: Path,
+        script_name: str,
+        workdir: str,
+        env: str,
+        priority: int,
+        level: str,
+        peak: int,
+        auto_retry: bool,
+        depends_on: list[str] | None = None,
+    ) -> str:
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        exp_id = uuid.uuid4().hex[:12]
+        depends_on = self._normalize_dependency_ids(depends_on or [])
+        self._validate_dependency_ids(exp_id, depends_on)
+        local_script = UPLOAD_DIR / f"{exp_id}.sh"
+        shutil.copy2(script_src, local_script)
+        try:
+            script_src.unlink(missing_ok=True)
+        except OSError:
+            pass
+        target_server_id = server_id or "default"
+        target_runtime = self.runtime_for(target_server_id)
+        with self.store.lock:
+            data = self.store.data
+            experiments = data.setdefault("experiments", [])
+            sequence = max([safe_int(item.get("created_seq"), 0) for item in experiments] or [0]) + 1
+            task_no = max(safe_int(data.get("next_experiment_no"), 1), 1)
+            data["next_experiment_no"] = task_no + 1
+            initial_status, pause_reason = self._initial_queue_status(target_server_id, target_runtime)
+            experiments.append(
+                {
+                    "id": exp_id,
+                    "task_no": task_no,
+                    "server_id": target_server_id,
+                    "name": name,
+                    "script_name": script_name,
+                    "local_script": str(local_script),
+                    "workdir": workdir,
+                    "conda_env": env,
+                    "priority": max(1, min(999, priority)),
+                    "execution_level": level,
+                    "peak_memory_mb": max(0, peak),
+                    "auto_peak_memory_mb": 0,
+                    "auto_retry_oom": auto_retry,
+                    "depends_on": depends_on,
+                    "dependency_reason": "",
+                    "status": initial_status,
+                    "pause_reason": pause_reason,
+                    "paused_process": False,
+                    "created_at": now_iso(),
+                    "created_seq": sequence,
+                    "attempts": 0,
+                    "oom_attempts": 0,
+                    "failure_reason": "",
+                    "validation_error": "",
+                }
+            )
+            record = next(
+                (item for item in data.setdefault("servers", []) if item.get("id") == target_server_id), None
+            )
+            if record is not None:
+                record.setdefault("preferences", {}).update(
+                    {"workdir": workdir, "conda_env": env, "peak_memory_mb": max(0, peak), "execution_level": level}
+                )
+            data.setdefault("preferences", {}).update(
+                {"workdir": workdir, "conda_env": env, "peak_memory_mb": max(0, peak), "execution_level": level}
+            )
+            self.store.save()
+        if target_runtime.connected and initial_status == "queued":
+            threading.Thread(target=target_runtime.tick, daemon=True).start()
+        return exp_id
+
+    def update_experiment(
+        self,
+        exp_id: str,
+        name: str,
+        script_src: Path | None,
+        script_name: str | None,
+        workdir: str,
+        env: str,
+        priority: int,
+        level: str,
+        peak: int,
+        auto_retry: bool,
+        depends_on: list[str] | None = None,
+    ) -> None:
+        depends_on = self._normalize_dependency_ids(depends_on or [])
+        self._validate_dependency_ids(exp_id, depends_on)
+        with self.store.lock:
+            stored = self._experiment_record(exp_id)
+            if stored is None:
+                raise ValueError("实验不存在")
+            if stored.get("status") == "running" or stored.get("paused_process"):
+                raise ValueError("执行中的任务需要先暂停或停止")
+            server_id = str(stored.get("server_id") or "default")
+            local_script = Path(str(stored.get("local_script") or (UPLOAD_DIR / f"{exp_id}.sh")))
+        local_script.parent.mkdir(parents=True, exist_ok=True)
+        if script_src is not None:
+            try:
+                same_script = script_src.resolve() == local_script.resolve()
+            except OSError:
+                same_script = False
+            if not same_script:
+                shutil.copy2(script_src, local_script)
+            else:
+                script_src = None
+            try:
+                script_src.unlink(missing_ok=True) if script_src else None
+            except OSError:
+                pass
+        target_runtime = self.runtime_for(server_id)
+        with self.store.lock:
+            stored = self._experiment_record(exp_id)
+            if stored is None:
+                raise ValueError("实验不存在")
+            data = self.store.data
+            record = next(
+                (item for item in data.setdefault("servers", []) if item.get("id") == server_id), None
+            )
+            new_status, pause_reason = self._initial_queue_status(server_id, target_runtime)
+            stored.update(
+                {
+                    "name": name,
+                    "script_name": script_name or stored.get("script_name"),
+                    "local_script": str(local_script),
+                    "workdir": workdir,
+                    "conda_env": env,
+                    "priority": max(1, min(999, priority)),
+                    "execution_level": level,
+                    "peak_memory_mb": max(0, peak),
+                    "auto_peak_memory_mb": 0,
+                    "auto_retry_oom": auto_retry,
+                    "depends_on": depends_on,
+                    "dependency_reason": "",
+                    "status": new_status,
+                    "pause_reason": pause_reason,
+                    "paused_process": False,
+                    "failure_reason": "",
+                    "validation_error": "",
+                    "finished_at": "",
+                    "exit_code": None,
+                    "assigned_gpu": None,
+                    "pid": 0,
+                    "process_group_id": 0,
+                }
+            )
+            if record is not None:
+                record.setdefault("preferences", {}).update(
+                    {"workdir": workdir, "conda_env": env, "peak_memory_mb": max(0, peak), "execution_level": level}
+                )
+            data.setdefault("preferences", {}).update(
+                {"workdir": workdir, "conda_env": env, "peak_memory_mb": max(0, peak), "execution_level": level}
+            )
+            self.store.save()
+        if target_runtime.connected and new_status == "queued":
+            threading.Thread(target=target_runtime.tick, daemon=True).start()
+
+    def connect(self, server_id: str, profile: dict[str, Any], password: str, save_password: bool) -> dict[str, Any]:
+        record = next(
+            (item for item in self.store.data.get("servers", []) if item.get("id") == server_id), None
+        )
+        if record is None:
+            raise ValueError("服务器不存在")
+        record["profile"] = dict(profile)
+        self.store.save()
+        selected_runtime = self.runtime_for(server_id)
+        try:
+            selected_runtime.connect(profile, password, save_password)
+        except Exception as exc:
+            selected_runtime.last_error = str(exc)
+            self.store.save()
+            raise
+        self.store.data["active_server_id"] = server_id
+        self.store.save()
+        return self.public_state()
+
+    def disconnect(self, server_id: str | None = None) -> None:
+        self.runtime_for(server_id or self.active_server_id).disconnect()
+
+    def auto_connect(self) -> None:
+        for record in self.store.data.get("servers", []):
+            if not record.get("enabled", True) or not record.get("auto_connect"):
+                continue
+            server_id = str(record.get("id"))
+            rt = self.runtime_for(server_id)
+            profile = dict(record.get("profile") or {})
+            if not profile.get("host") or not profile.get("username") or rt.connected:
+                continue
+            if not rt.saved_password(profile):
+                continue
+
+            def worker(selected=server_id, selected_profile=profile, selected_runtime=rt) -> None:
+                try:
+                    selected_runtime.connect(selected_profile, "", True)
+                except Exception as exc:
+                    selected_runtime.last_error = str(exc)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+    def run_benchmark(self, server_id: str, gpu_index: int, seconds: int = 5, conda_env: str = "") -> dict[str, Any]:
+        record = next(
+            (item for item in self.store.data.get("servers", []) if item.get("id") == server_id), {}
+        )
+        if not record.get("enabled", True):
+            raise RuntimeError("该服务器监控已停用，请先启用监控")
+        return self.runtime_for(server_id).run_benchmark(gpu_index, seconds=seconds, conda_env=conda_env)
+
+    def read_log(self, experiment: dict[str, Any]) -> str:
+        return self.runtime_for(str(experiment.get("server_id") or "default"))._read_log(experiment)
+
+
+manager = RuntimeManager(store)
+
+
+def _profile_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "host": str(payload.get("host", "")).strip(),
+        "port": safe_int(payload.get("port"), 22),
+        "username": str(payload.get("username", "")).strip(),
+        "home": str(payload.get("home", "")).strip(),
+        "poll_interval": max(2, min(60, safe_int(payload.get("poll_interval"), 5))),
+    }
+
+
+def _form_level(value: str) -> str:
+    return value if value in ("idle_only", "emergency") else "idle_only"
+
+
 @app.route("/", methods=["GET"])
 def index():
     return render_template("index.html")
@@ -975,37 +1672,93 @@ def index():
 
 @app.route("/api/state", methods=["GET"])
 def api_state():
-    return jsonify(runtime.public_state())
+    return jsonify(manager.public_state())
 
 
 @app.route("/api/connect", methods=["POST"])
 def api_connect():
     payload = request.get_json(silent=True) or {}
-    profile = {
-        "host": str(payload.get("host", "")).strip(),
-        "port": safe_int(payload.get("port"), 22),
-        "username": str(payload.get("username", "")).strip(),
-        "home": str(payload.get("home", "")).strip(),
-        "poll_interval": max(2, min(60, safe_int(payload.get("poll_interval"), 5))),
-    }
+    server_id = str(payload.get("server_id") or manager.active_server_id or "default")
+    profile = _profile_from_payload(payload)
     try:
-        data = runtime.connect(profile, str(payload.get("password", "")), bool(payload.get("save_password")))
-        return jsonify(data)
+        return jsonify(manager.connect(server_id, profile, str(payload.get("password", "")), bool(payload.get("save_password"))))
     except Exception as exc:
         return jsonify({"error": str(exc)}), 400
 
 
 @app.route("/api/disconnect", methods=["POST"])
 def api_disconnect():
-    runtime.disconnect()
-    return jsonify(runtime.public_state())
+    payload = request.get_json(silent=True) or {}
+    manager.disconnect(str(payload.get("server_id") or "") or None)
+    return jsonify(manager.public_state())
 
 
 @app.route("/api/poll", methods=["POST"])
 def api_poll():
+    payload = request.get_json(silent=True) or {}
+    server_id = str(payload.get("server_id") or "") or manager.active_server_id
     try:
-        runtime.tick()
-        return jsonify(runtime.public_state())
+        manager.runtime_for(server_id).tick()
+        return jsonify(manager.public_state())
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/servers", methods=["POST"])
+def api_upsert_server():
+    payload = request.get_json(silent=True) or {}
+    profile = _profile_from_payload(payload)
+    name = str(payload.get("name") or "").strip()
+    server_id = str(payload.get("id") or "").strip() or None
+    try:
+        new_id = manager.upsert_server(server_id, name, profile, bool(payload.get("auto_connect")))
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+    password = str(payload.get("password") or "")
+    if payload.get("connect_now") and (password or manager.runtime_for(new_id).saved_password(profile)):
+        try:
+            manager.connect(new_id, profile, password, bool(payload.get("save_password")))
+        except Exception as exc:
+            state = manager.public_state()
+            state["warning"] = f"服务器已保存，但连接失败：{exc}"
+            return jsonify(state)
+    return jsonify(manager.public_state())
+
+
+@app.route("/api/servers/<server_id>/delete", methods=["POST"])
+def api_delete_server(server_id: str):
+    try:
+        manager.remove_server(server_id)
+        return jsonify(manager.public_state())
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/servers/<server_id>/enabled", methods=["POST"])
+def api_server_enabled(server_id: str):
+    payload = request.get_json(silent=True) or {}
+    try:
+        manager.set_enabled(server_id, bool(payload.get("enabled", True)))
+        return jsonify(manager.public_state())
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/servers/<server_id>/active", methods=["POST"])
+def api_server_active(server_id: str):
+    try:
+        manager.set_active(server_id)
+        return jsonify(manager.public_state())
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/servers/<server_id>/scheduler", methods=["POST"])
+def api_server_scheduler(server_id: str):
+    payload = request.get_json(silent=True) or {}
+    try:
+        manager.set_scheduler_paused(server_id, bool(payload.get("paused", False)))
+        return jsonify(manager.public_state())
     except Exception as exc:
         return jsonify({"error": str(exc)}), 400
 
@@ -1017,96 +1770,152 @@ def api_create_experiment():
         return jsonify({"error": "请选择一个 .sh 文件"}), 400
     if not upload.filename.lower().endswith(".sh"):
         return jsonify({"error": "当前只接受 .sh 文件"}), 400
-    exp_id = uuid.uuid4().hex[:12]
-    local_script = UPLOAD_DIR / f"{exp_id}.sh"
-    upload.save(local_script)
-    prefs = store.data.setdefault("preferences", {})
-    workdir = str(request.form.get("workdir", "")).strip() or str(prefs.get("workdir", "")).strip()
-    env = str(request.form.get("conda_env", "")).strip() or str(prefs.get("conda_env", "")).strip()
-    peak = max(0, safe_int(request.form.get("peak_memory_mb"), safe_int(prefs.get("peak_memory_mb"), 0)))
-    level = request.form.get("execution_level", "idle_only")
-    if level not in ("idle_only", "emergency"):
-        level = "idle_only"
-    priority = max(1, min(999, safe_int(request.form.get("priority"), 50)))
-    name = clean_name(request.form.get("name", ""), Path(upload.filename).stem)
-    seq = max([safe_int(item.get("created_seq"), 0) for item in store.data.get("experiments", [])] or [0]) + 1
-    task_no = max(safe_int(store.data.get("next_experiment_no"), 1), 1)
-    store.data["next_experiment_no"] = task_no + 1
-    experiment = {
-        "id": exp_id,
-        "task_no": task_no,
-        "name": name,
-        "script_name": upload.filename,
-        "local_script": str(local_script),
-        "workdir": workdir,
-        "conda_env": env,
-        "priority": priority,
-        "execution_level": level,
-        "peak_memory_mb": peak,
-        "auto_peak_memory_mb": 0,
-        "auto_retry_oom": request.form.get("auto_retry_oom") == "true",
-        "depends_on": [],
-        "dependency_reason": "",
-        "status": "queued",
-        "created_at": now_iso(),
-        "created_seq": seq,
-        "attempts": 0,
-        "oom_attempts": 0,
-        "failure_reason": "",
-        "validation_error": "",
-    }
-    store.data.setdefault("experiments", []).append(experiment)
-    prefs.update({"workdir": workdir, "conda_env": env, "peak_memory_mb": peak, "execution_level": level})
-    store.save()
-    if runtime.connected:
+    temp_path = UPLOAD_DIR / f"upload-{uuid.uuid4().hex[:8]}.sh"
+    upload.save(temp_path)
+    prefs = manager.runtime_for(str(request.form.get("server_id") or "") or None)._preferences_data()
+    try:
+        manager.add_experiment(
+            server_id=str(request.form.get("server_id") or "") or manager.active_server_id,
+            name=clean_name(request.form.get("name", ""), Path(upload.filename).stem),
+            script_src=temp_path,
+            script_name=upload.filename,
+            workdir=str(request.form.get("workdir", "")).strip() or str(prefs.get("workdir", "")).strip(),
+            env=str(request.form.get("conda_env", "")).strip() or str(prefs.get("conda_env", "")).strip(),
+            priority=safe_int(request.form.get("priority"), 50),
+            level=_form_level(str(request.form.get("execution_level", "idle_only"))),
+            peak=safe_int(request.form.get("peak_memory_mb"), safe_int(prefs.get("peak_memory_mb"), 0)),
+            auto_retry=request.form.get("auto_retry_oom") == "true",
+            depends_on=request.form.getlist("depends_on"),
+        )
+    except Exception as exc:
         try:
-            runtime.tick()
-        except Exception:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
             pass
-    return jsonify(runtime.public_state()), 201
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(manager.public_state()), 201
+
+
+@app.route("/api/experiments/<exp_id>/update", methods=["POST"])
+def api_update_experiment(exp_id: str):
+    upload = request.files.get("script")
+    temp_path: Path | None = None
+    if upload is not None and upload.filename:
+        if not upload.filename.lower().endswith(".sh"):
+            return jsonify({"error": "当前只接受 .sh 文件"}), 400
+        temp_path = UPLOAD_DIR / f"upload-{uuid.uuid4().hex[:8]}.sh"
+        upload.save(temp_path)
+    stored = manager._experiment_record(exp_id)
+    if stored is None:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        return jsonify({"error": "实验不存在"}), 404
+    prefs = manager.runtime_for(str(stored.get("server_id") or "default"))._preferences_data()
+    try:
+        manager.update_experiment(
+            exp_id=exp_id,
+            name=clean_name(request.form.get("name", ""), stored.get("name") or "experiment"),
+            script_src=temp_path,
+            script_name=upload.filename if temp_path is not None else None,
+            workdir=str(request.form.get("workdir", "")).strip() or str(prefs.get("workdir", "")).strip(),
+            env=str(request.form.get("conda_env", "")).strip() or str(prefs.get("conda_env", "")).strip(),
+            priority=safe_int(request.form.get("priority"), safe_int(stored.get("priority"), 50)),
+            level=_form_level(str(request.form.get("execution_level", stored.get("execution_level", "idle_only")))),
+            peak=safe_int(request.form.get("peak_memory_mb"), safe_int(stored.get("peak_memory_mb"), 0)),
+            auto_retry=request.form.get("auto_retry_oom") == "true",
+            depends_on=request.form.getlist("depends_on"),
+        )
+    except Exception as exc:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(manager.public_state())
+
+
+@app.route("/api/experiments/<exp_id>/pause", methods=["POST"])
+def api_pause_experiment(exp_id: str):
+    try:
+        manager.set_experiment_paused(exp_id, True)
+        return jsonify(manager.public_state())
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/experiments/<exp_id>/resume", methods=["POST"])
+def api_resume_experiment(exp_id: str):
+    try:
+        manager.set_experiment_paused(exp_id, False)
+        return jsonify(manager.public_state())
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/experiments/<exp_id>/requeue", methods=["POST"])
+def api_requeue_experiment(exp_id: str):
+    try:
+        manager.requeue_experiment(exp_id)
+        return jsonify(manager.public_state())
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
 
 
 @app.route("/api/experiments/<exp_id>/retry", methods=["POST"])
 def api_retry(exp_id: str):
-    with runtime.lock:
-        item = next((e for e in store.data.get("experiments", []) if e.get("id") == exp_id), None)
-        if item is None:
-            return jsonify({"error": "实验不存在"}), 404
-        if item.get("status") == "running":
-            return jsonify({"error": "运行中的实验不能重试"}), 400
-        item.update({"status": "queued", "failure_reason": "", "validation_error": "", "finished_at": ""})
-        store.save()
-    return jsonify(runtime.public_state())
+    try:
+        manager.retry_experiment(exp_id)
+        return jsonify(manager.public_state())
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
 
 
 @app.route("/api/experiments/<exp_id>/cancel", methods=["POST"])
 def api_cancel(exp_id: str):
-    with runtime.lock:
-        item = next((e for e in store.data.get("experiments", []) if e.get("id") == exp_id), None)
-        if item is None:
-            return jsonify({"error": "实验不存在"}), 404
-        if item.get("status") == "running" and safe_int(item.get("pid"), 0):
-            try:
-                runtime.remote.exec(f"kill -TERM {safe_int(item.get('pid'))} >/dev/null 2>&1 || true", timeout=10)
-            except Exception:
-                pass
-        if item.get("status") in ("queued", "waiting_memory", "running"):
-            item["status"] = "canceled"
-            item["finished_at"] = now_iso()
-            item["failure_reason"] = "已取消"
-        store.save()
-    return jsonify(runtime.public_state())
+    try:
+        manager.cancel_experiment(exp_id)
+        return jsonify(manager.public_state())
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/experiments/<exp_id>/delete", methods=["POST"])
+def api_delete_experiment(exp_id: str):
+    try:
+        manager.delete_experiment(exp_id)
+        return jsonify(manager.public_state())
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/experiments/pause_all", methods=["POST"])
+def api_pause_all():
+    try:
+        manager.pause_all_experiments()
+        return jsonify(manager.public_state())
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/experiments/resume_all", methods=["POST"])
+def api_resume_all():
+    try:
+        manager.resume_all_experiments()
+        return jsonify(manager.public_state())
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
 
 
 @app.route("/api/experiments/<exp_id>/log", methods=["GET"])
 def api_log(exp_id: str):
-    item = next((e for e in store.data.get("experiments", []) if e.get("id") == exp_id), None)
+    item = manager._experiment_record(exp_id)
     if item is None:
         return jsonify({"error": "实验不存在"}), 404
-    if not runtime.connected:
+    if not manager.runtime_for(str(item.get("server_id") or "default")).connected:
         return jsonify({"log": "当前未连接服务器", "path": item.get("log_path", "")})
     try:
-        return jsonify({"log": runtime._read_log(item), "path": item.get("log_path", "")})
+        return jsonify({"log": manager.read_log(item), "path": item.get("log_path", "")})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 400
 
@@ -1114,13 +1923,15 @@ def api_log(exp_id: str):
 @app.route("/api/benchmark", methods=["POST"])
 def api_benchmark():
     payload = request.get_json(silent=True) or {}
+    server_id = str(payload.get("server_id") or "") or manager.active_server_id
     try:
-        result = runtime.run_benchmark(
+        result = manager.run_benchmark(
+            server_id,
             safe_int(payload.get("gpu_index"), 0),
             seconds=safe_int(payload.get("seconds"), 5),
             conda_env=str(payload.get("conda_env", "")).strip(),
         )
-        return jsonify({"result": result, "state": runtime.public_state()})
+        return jsonify({"result": result, "state": manager.public_state()})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 400
 
@@ -1128,8 +1939,9 @@ def api_benchmark():
 @app.route("/api/preferences", methods=["POST"])
 def api_preferences():
     payload = request.get_json(silent=True) or {}
-    with runtime.lock:
-        prefs = store.data.setdefault("preferences", {})
+    server_id = str(payload.get("server_id") or "") or manager.active_server_id
+    with manager.store.lock:
+        prefs = manager.runtime_for(server_id)._preferences_data()
         if "workdir" in payload:
             prefs["workdir"] = str(payload.get("workdir") or "")
         if "conda_env" in payload:
@@ -1139,9 +1951,19 @@ def api_preferences():
         if "execution_level" in payload and payload.get("execution_level") in ("idle_only", "emergency"):
             prefs["execution_level"] = payload.get("execution_level")
         store.save()
-    return jsonify(runtime.public_state())
+    return jsonify(manager.public_state())
+
+
+def _auto_connect_worker() -> None:
+    time.sleep(0.8)
+    try:
+        manager.auto_connect()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
+    threading.Thread(target=_auto_connect_worker, name="auto-connect", daemon=True).start()
     app.run(host="127.0.0.1", port=8765, debug=False, threaded=True)
+
 

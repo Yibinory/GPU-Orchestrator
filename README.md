@@ -26,11 +26,17 @@
 
     python -m pip install -r requirements.txt
 
-启动原生客户端：
+启动网页版（推荐）：
+
+    python app.py
+
+然后浏览器打开 <http://127.0.0.1:8765/>。Windows 也可以双击 start_web.bat，它会启动服务并自动打开浏览器。网页版与桌面版共用 data/state.json 和后端调度逻辑，功能对等：多服务器管理、任务暂停/恢复/重排队/编辑/删除、前序依赖、暂停全部、调度暂停、GPU 测试和实时日志都可在浏览器完成。
+
+启动原生桌面客户端（可选）：
 
     python desktop_client.py
 
-Windows 也可以双击 start_client.bat。它会直接打开原生客户端窗口，不会启动浏览器或本地网站。
+Windows 也可以双击 start_client.bat。它会直接打开原生客户端窗口，不会启动浏览器或本地网站。注意网页版和桌面版不要同时运行，以免同时写 data/state.json。
 
 首次连接会自动接受 SSH 主机指纹，适合个人内网原型；生产环境建议改为严格校验 known_hosts。远程主机需要可用的 python3 和 nvidia-smi。要执行 Tensor 测试，选择的 Python / Conda 环境需要安装 PyTorch CUDA 版本。
 
