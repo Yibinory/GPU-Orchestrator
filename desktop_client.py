@@ -10,6 +10,40 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+
+def _enable_windows_dpi_awareness() -> None:
+    """Let Windows render the client at display DPI instead of bitmap-scaling it."""
+    if sys.platform != "win32":
+        return
+
+    try:
+        set_context = ctypes.windll.user32.SetProcessDpiAwarenessContext
+        set_context.argtypes = [ctypes.c_void_p]
+        set_context.restype = ctypes.c_bool
+        if set_context(ctypes.c_void_p(-4)):  # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+            return
+    except (AttributeError, OSError):
+        pass
+
+    try:
+        set_awareness = ctypes.windll.shcore.SetProcessDpiAwareness
+        set_awareness.argtypes = [ctypes.c_int]
+        set_awareness.restype = ctypes.c_long
+        set_awareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+        return
+    except (AttributeError, OSError):
+        pass
+
+    try:
+        set_legacy_awareness = ctypes.windll.user32.SetProcessDPIAware
+        set_legacy_awareness.restype = ctypes.c_bool
+        set_legacy_awareness()
+    except (AttributeError, OSError):
+        pass
+
+
+_enable_windows_dpi_awareness()
+
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
