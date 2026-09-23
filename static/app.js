@@ -335,7 +335,7 @@ function renderQueue() {
     return '<tr><td><div class="experiment-cell"><div class="experiment-avatar">' + esc(taskNo(item)) + '</div><div class="experiment-title"><strong title="' + esc(item.name) + '">' + esc(item.name) + '</strong><small>' + esc(item.script_name) + ' · ' + esc(serverName(item.server_id)) + ' · ' + esc(fmtTime(item.created_at)) + '</small></div></div></td>' +
       '<td><span class="status-pill ' + esc(item.status) + '">' + esc(statusLabels[item.status] || item.status) + '</span>' + (hint ? '<div class="failure-hint" title="' + esc(hint) + '">' + esc(hint) + '</div>' : '') + '</td>' +
       '<td><span class="priority">P' + esc(item.priority) + '</span></td>' +
-      '<td><span class="strategy">' + (item.execution_level === 'emergency' ? '紧急 · 有显存即跑' : '默认 · GPU 空闲') + '</span></td>' +
+      '<td><span class="strategy">' + (item.execution_level === 'emergency' ? '紧急 · 有显存即跑' : item.execution_level === 'low_interference' ? '低干扰 · 低峰忙卡' : '默认 · GPU 空闲') + '</span></td>' +
       '<td><span class="gpu-target">' + gpu + '</span></td>' +
       '<td><span class="gpu-target">' + memory + '</span></td>' +
       '<td><span class="gpu-target">' + esc(dependencyLabels(item)) + '</span></td>' +
@@ -431,13 +431,13 @@ function renderLogs() {
   loadLog();
 }
 
-async function loadLog() {
+async function loadLog(full) {
   if (!UI.selectedLog) return;
   const item = (UI.data.experiments || []).find(function (exp) { return exp.id === UI.selectedLog; });
   if (!item) return;
   $('#log-title').textContent = taskNo(item) + ' ' + item.name;
   try {
-    const data = await api('/api/experiments/' + encodeURIComponent(UI.selectedLog) + '/log');
+    const data = await api('/api/experiments/' + encodeURIComponent(UI.selectedLog) + '/log' + (full ? '?full=1' : ''));
     $('#log-viewer').textContent = data.log || '暂无输出';
     $('#log-viewer').scrollTop = $('#log-viewer').scrollHeight;
   } catch (error) {
@@ -447,6 +447,7 @@ async function loadLog() {
 
 function renderServers() {
   const root = $('#server-cards');
+  $('#gpu-history-samples').value = (UI.data.global_settings || {}).gpu_history_samples || 5;
   const servers = UI.data.servers || [];
   if (!servers.length) {
     root.innerHTML = '<div class="empty-state">还没有服务器记录。</div>';
@@ -577,6 +578,7 @@ function openServerModal(serverId) {
   $('#server-form-port').value = profile.port || 22;
   $('#server-form-username').value = profile.username || '';
   $('#server-form-interval').value = profile.poll_interval || 5;
+  $('#server-form-disk').value = record.disk_alert_gb != null ? record.disk_alert_gb : 5;
   $('#server-form-password').value = '';
   $('#server-form-identity').value = profile.identity_file || '';
   $('#server-form-sshconfig').value = '';
@@ -636,6 +638,9 @@ function openExperimentModal(item) {
   const prefs = preferencesFor(targetServer);
   $('#experiment-workdir').value = editing ? (item.workdir || '') : (prefs.workdir || '');
   $('#experiment-memory').value = editing ? (item.peak_memory_mb || '') : (prefs.peak_memory_mb || '');
+  $('#experiment-max-util').value = editing
+    ? (item.max_gpu_utilization != null ? item.max_gpu_utilization : 30)
+    : (prefs.max_gpu_utilization != null ? prefs.max_gpu_utilization : 30);
   renderCondaOptions(targetServer, editing ? item.conda_env : prefs.conda_env);
   $('[name="priority"]', $('#experiment-form')).value = editing ? (item.priority || 50) : 50;
   $('[name="execution_level"]', $('#experiment-form')).value = editing ? (item.execution_level || 'idle_only') : (prefs.execution_level || 'idle_only');
@@ -725,7 +730,15 @@ $$('.filter-tab').forEach(function (button) {
     renderQueue();
   });
 });
-$('#reload-log').addEventListener('click', loadLog);
+$('#reload-log').addEventListener('click', function () { loadLog(); });
+$('#load-full-log').addEventListener('click', function () { loadLog(true); });
+$('#save-global-settings').addEventListener('click', async function () {
+  try {
+    UI.data = await postJson('/api/preferences', { gpu_history_samples: $('#gpu-history-samples').value });
+    renderAll();
+    showToast('全局设置已保存');
+  } catch (error) { showToast(error.message, true); }
+});
 $('#pause-all-button').addEventListener('click', async function () {
   if (!window.confirm('确定暂停全部服务器的所有任务吗？运行中的进程会被挂起。')) return;
   try { UI.data = await postJson('/api/experiments/pause_all'); renderAll(); showToast('已暂停全部任务'); }
@@ -795,6 +808,7 @@ $('#server-form').addEventListener('submit', async function (event) {
       username: form.get('username'),
       password: form.get('password'),
       identity_file: form.get('identity_file'),
+      disk_alert_gb: form.get('disk_alert_gb'),
       poll_interval: form.get('poll_interval'),
       auto_connect: $('#server-form-auto').checked,
       save_password: $('#server-form-save').checked,

@@ -191,6 +191,13 @@ button { cursor: pointer; }
 .check-list-item input { margin-top: 2px; accent-color: var(--green); }
 .check-list-item strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #33443d; font-size: 10px; }
 .check-list-item small { display: block; margin-top: 2px; color: #93a09a; font-size: 9px; }
+.log-actions { display: flex; align-items: center; gap: 14px; }
+.global-settings-panel { margin-top: 14px; }
+.global-settings-row { display: flex; align-items: flex-end; gap: 14px; padding: 0 21px 21px; }
+.global-settings-row label { display: flex; flex-direction: column; gap: 7px; color: #65746c; font-size: 10px; font-weight: 700; }
+.global-settings-row input { width: 120px; border: 1px solid #dce6e1; border-radius: 7px; outline: 0; padding: 10px 11px; background: #fbfdfc; color: #304039; font-size: 12px; font-weight: 500; }
+.global-settings-row input:focus { border-color: #80ceb0; box-shadow: 0 0 0 3px #e7f7ef; }
+.global-settings-row small { color: #9aa7a0; font-size: 9px; font-weight: 400; }
 .queue-summary > div { padding: 15px 17px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
 .queue-summary span { display: block; color: #86938d; font-size: 10px; }
 .queue-summary strong { display: block; margin-top: 7px; color: var(--ink); font-size: 23px; letter-spacing: -.04em; }
