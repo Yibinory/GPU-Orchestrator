@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import ctypes
+import math
 import shutil
 import sys
 import threading
@@ -45,29 +46,31 @@ def _enable_windows_dpi_awareness() -> None:
 _enable_windows_dpi_awareness()
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, ttk
 
 from app import Runtime, UPLOAD_DIR, clean_name, now_iso, runtime as default_runtime, safe_float, safe_int, store
 
 
 # A native Windows desktop shell around the SSH/runtime layer. It does not start Flask.
 COLORS = {
-    "bg": "#f4f7f5",
+    "bg": "#f3f5f9",
     "surface": "#ffffff",
-    "surface_soft": "#f8faf9",
-    "ink": "#10221e",
-    "muted": "#75827c",
-    "line": "#e1eae5",
-    "green": "#13a673",
-    "green_dark": "#087653",
-    "mint": "#dff8ed",
-    "lime": "#bdf25b",
-    "amber": "#dfa04b",
-    "purple": "#9174d5",
-    "blue": "#6ca9ed",
-    "red": "#df5d58",
-    "navy": "#102d29",
-    "navy_soft": "#1c4a3f",
+    "surface_soft": "#f7f9fc",
+    "ink": "#17243b",
+    "muted": "#6b7b92",
+    "line": "#e2e8f1",
+    "green": "#099b8b",
+    "green_dark": "#087f73",
+    "mint": "#e4f5f1",
+    "lime": "#69dfc2",
+    "amber": "#bb812a",
+    "purple": "#8870d5",
+    "blue": "#508fe3",
+    "red": "#d55764",
+    "navy": "#111d31",
+    "navy_soft": "#21344d",
+    "nav_text": "#9bacc3",
+    "terminal": "#152238",
 }
 
 FONT = "Microsoft YaHei UI"
@@ -148,6 +151,47 @@ EXECUTION_LEVEL_LABELS = {
     "emergency": "紧急执行 · 有足够显存即运行",
 }
 EXECUTION_LEVEL_KEYS = {label: key for key, label in EXECUTION_LEVEL_LABELS.items()}
+
+
+class ResourceBar(tk.Canvas):
+    """Draw resource usage explicitly, independent of ttk theme geometry."""
+
+    PALETTES = {
+        "Green": (COLORS["green"], "#e3eeed"),
+        "Purple": (COLORS["purple"], "#eeeaf8"),
+        "Blue": (COLORS["blue"], "#e8f0fb"),
+        "Amber": (COLORS["amber"], "#f7efdf"),
+    }
+
+    def __init__(self, parent: tk.Misc, style: str, maximum: float = 100, value: float = 0) -> None:
+        self._value = float(value)
+        self._maximum = float(maximum)
+        self._bar_style = style
+        self.fill_color, self.track_color = self.PALETTES.get(style.split(".")[0], self.PALETTES["Green"])
+        height = max(10, round(parent.winfo_fpixels("1i") / 96 * 10))
+        super().__init__(parent, height=height, width=80, bg=parent.cget("bg"), bd=0, highlightthickness=0)
+        self.create_rectangle(0, 0, 0, 0, fill=self.track_color, outline="", tags="track")
+        self.create_rectangle(0, 0, 0, 0, fill=self.fill_color, outline="", tags="fill")
+        self.bind("<Configure>", self._draw)
+
+    def _draw(self, _event: Any = None) -> None:
+        width, height = self.winfo_width(), self.winfo_height()
+        ratio = max(0, min(1, self._value / self._maximum)) if self._maximum > 0 else 0
+        self.coords("track", 0, 0, width, height)
+        self.coords("fill", 0, 0, width * ratio, height)
+        self.itemconfigure("fill", state="normal" if ratio > 0 else "hidden")
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        if key in ("value", "maximum"):
+            setattr(self, "_" + key, safe_float(value))
+            self._draw()
+        else:
+            super().__setitem__(key, value)
+
+    def __getitem__(self, key: str) -> Any:
+        if key in ("value", "maximum"):
+            return getattr(self, "_" + key)
+        return super().__getitem__(key)
 
 
 class DesktopRuntimeManager:
@@ -580,7 +624,7 @@ class DesktopClient(tk.Tk):
                 pass
         super().__init__()
         self.title("算力调度台 · GPU Orchestrator")
-        self.geometry("1280x820")
+        self.geometry("1380x880")
         self.minsize(1080, 700)
         self.configure(bg=COLORS["bg"])
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -608,6 +652,7 @@ class DesktopClient(tk.Tk):
         self.status_var = tk.StringVar(value="准备就绪")
         self.header_kicker = tk.StringVar(value="LIVE RESOURCE MAP")
         self.header_title = tk.StringVar(value="资源总览")
+        self.header_description = tk.StringVar()
         self.monitor_summary = tk.StringVar(value="监控服务器：0 · 活跃：0")
         self.connection_text = tk.StringVar(value="离线")
         self.last_sync = tk.StringVar(value="尚未同步")
@@ -640,7 +685,7 @@ class DesktopClient(tk.Tk):
                         self.iconphoto(True, self.app_logo_image)
                     except tk.TclError:
                         pass
-                scale = max(1, self.app_logo_image.width() // 32)
+                scale = max(1, self.app_logo_image.width() // 64)
                 self.sidebar_logo_image = self.app_logo_image.subsample(scale, scale)
         except (OSError, tk.TclError):
             self.app_logo_image = None
@@ -654,8 +699,10 @@ class DesktopClient(tk.Tk):
             pass
         style.configure("App.TFrame", background=COLORS["bg"])
         style.configure("Card.TFrame", background=COLORS["surface"])
-        style.configure("Treeview", background=COLORS["surface"], fieldbackground=COLORS["surface"], foreground=COLORS["ink"], rowheight=36, font=(FONT, 10), borderwidth=0)
-        style.configure("Treeview.Heading", background=COLORS["surface_soft"], foreground=COLORS["muted"], font=(FONT, 9, "bold"), relief="flat")
+        style.configure("Treeview", background=COLORS["surface"], fieldbackground=COLORS["surface"], foreground=COLORS["ink"], rowheight=42, font=(FONT, 10), borderwidth=0)
+        style.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
+        style.configure("Treeview.Heading", background=COLORS["surface_soft"], foreground=COLORS["muted"], font=(FONT, 9, "bold"), relief="flat", padding=(10, 10))
+        style.map("Treeview.Heading", background=[("active", "#edf1f7")])
         style.map("Treeview", background=[("selected", COLORS["mint"])], foreground=[("selected", COLORS["green_dark"])])
         style.configure(
             "TCombobox",
@@ -684,30 +731,97 @@ class DesktopClient(tk.Tk):
         )
         style.configure(
             "TScrollbar",
-            background="#bfd6ca",
-            troughcolor="#edf3ef",
-            bordercolor="#edf3ef",
-            lightcolor="#edf3ef",
-            darkcolor="#edf3ef",
-            arrowcolor="#5f7f72",
+            background="#c5d0df",
+            troughcolor="#edf1f6",
+            bordercolor="#edf1f6",
+            lightcolor="#edf1f6",
+            darkcolor="#edf1f6",
+            arrowcolor="#6b7b92",
             borderwidth=0,
             relief="flat",
             width=11,
         )
         style.map(
             "TScrollbar",
-            background=[("pressed", "#76b396"), ("active", "#9fcab4"), ("!active", "#bfd6ca")],
-            arrowcolor=[("pressed", COLORS["green_dark"]), ("active", COLORS["green_dark"]), ("!active", "#5f7f72")],
+            background=[("pressed", "#91a5be"), ("active", "#a9bbd1"), ("!active", "#c5d0df")],
+            arrowcolor=[("pressed", COLORS["green_dark"]), ("active", COLORS["green_dark"]), ("!active", "#6b7b92")],
         )
-        style.configure("Green.Horizontal.TProgressbar", troughcolor="#e9f0ec", background=COLORS["green"], bordercolor="#e9f0ec", lightcolor=COLORS["green"], darkcolor=COLORS["green"])
-        style.configure("Purple.Horizontal.TProgressbar", troughcolor="#eeeaf8", background=COLORS["purple"], bordercolor="#eeeaf8", lightcolor=COLORS["purple"], darkcolor=COLORS["purple"])
-        style.configure("Blue.Horizontal.TProgressbar", troughcolor="#eaf2fc", background=COLORS["blue"], bordercolor="#eaf2fc", lightcolor=COLORS["blue"], darkcolor=COLORS["blue"])
-        style.configure("Amber.Horizontal.TProgressbar", troughcolor="#fbf2e2", background=COLORS["amber"], bordercolor="#fbf2e2", lightcolor=COLORS["amber"], darkcolor=COLORS["amber"])
         style.configure("TEntry", padding=6, font=(FONT, 10))
         style.configure("TNotebook", background=COLORS["bg"], borderwidth=0)
+        self._configure_controls(style)
+
+    def _field_image(self, fill: str, border: str, size: int = 32, radius: int = 6) -> tk.PhotoImage:
+        image = tk.PhotoImage(master=self, width=size, height=size)
+        for y in range(size):
+            distance = max(radius - y - 0.5, y - (size - radius - 0.5), 0)
+            inset = math.ceil(radius - math.sqrt(max(0, radius * radius - distance * distance))) if distance else 0
+            image.put(border, to=(inset, y, size - inset, y + 1))
+            if 0 < y < size - 1:
+                image.put(fill, to=(max(1, inset + 1), y, min(size - 1, size - inset - 1), y + 1))
+        return image
+
+    def _chevron_image(self, direction: str) -> tk.PhotoImage:
+        image = tk.PhotoImage(master=self, width=24, height=16)
+        for x in range(8):
+            y = 5 + min(x, 7 - x) if direction == "down" else 9 - min(x, 7 - x)
+            image.put(COLORS["muted"], to=(8 + x, y, 9 + x, y + 2))
+        return image
+
+    def _configure_controls(self, style: ttk.Style) -> None:
+        """One flat, rounded field and consistent dropdowns across all windows."""
+        images = self.control_images = {
+            "field": self._field_image(COLORS["surface"], COLORS["line"]),
+            "focus": self._field_image(COLORS["surface"], COLORS["green"]),
+            "disabled": self._field_image("#edf1f6", COLORS["line"]),
+            "down": self._chevron_image("down"),
+            "up": self._chevron_image("up"),
+            "unchecked": self._field_image(COLORS["surface"], "#b9c7d8", 20, 4),
+            "checked": self._field_image(COLORS["green"], COLORS["green"], 20, 4),
+        }
+        for x, y in ((5, 10), (6, 11), (7, 12), (8, 13), (9, 12), (10, 11), (11, 10), (12, 9), (13, 8), (14, 7)):
+            images["checked"].put("#ffffff", to=(x, y, x + 2, y + 2))
+        style.element_create("Modern.field", "image", images["field"], ("disabled", images["disabled"]), ("focus", images["focus"]), border=7, sticky="nsew")
+        style.element_create("Modern.downarrow", "image", images["down"])
+        style.element_create("Modern.uparrow", "image", images["up"])
+        style.element_create("Modern.check", "image", images["unchecked"], ("selected", images["checked"]))
+        style.layout("Modern.TEntry", [("Modern.field", {"sticky": "nswe", "children": [("Entry.padding", {"sticky": "nswe", "children": [("Entry.textarea", {"sticky": "nswe"})]})]})])
+        style.layout("TCombobox", [("Modern.field", {"sticky": "nswe", "children": [("Modern.downarrow", {"side": "right", "sticky": ""}), ("Combobox.padding", {"sticky": "nswe", "children": [("Combobox.textarea", {"sticky": "nswe"})]})]})])
+        style.layout("Modern.TSpinbox", [("Modern.field", {"sticky": "nswe", "children": [("Spinbox.buttons", {"side": "right", "sticky": "ns", "children": [("Modern.uparrow", {"side": "top", "sticky": "e"}), ("Modern.downarrow", {"side": "bottom", "sticky": "e"})]}), ("Spinbox.padding", {"sticky": "nswe", "children": [("Spinbox.textarea", {"sticky": "nswe"})]})]})])
+        images["checkgap"] = tk.PhotoImage(master=self, width=10, height=1)
+        style.element_create("Modern.checkgap", "image", images["checkgap"])
+        style.layout("Modern.TCheckbutton", [("Checkbutton.padding", {"sticky": "nswe", "children": [("Modern.check", {"side": "left", "sticky": "w"}), ("Modern.checkgap", {"side": "left", "sticky": "w"}), ("Checkbutton.label", {"side": "left", "sticky": "nswe"})]})])
+        for name in ("Modern.TEntry", "TCombobox", "Modern.TSpinbox"):
+            style.configure(name, padding=(12, 8), foreground=COLORS["ink"], fieldbackground=COLORS["surface"], background=COLORS["surface"], insertcolor=COLORS["ink"], selectbackground=COLORS["mint"], selectforeground=COLORS["green_dark"], font=(FONT, 10))
+            style.map(name, fieldbackground=[("disabled", "#edf1f6"), ("!disabled", COLORS["surface"])], foreground=[("disabled", "#8e9cb0"), ("!disabled", COLORS["ink"])], selectbackground=[("!focus", COLORS["surface"]), ("focus", COLORS["mint"])], selectforeground=[("!focus", COLORS["ink"]), ("focus", COLORS["green_dark"])])
+        style.configure("Modern.TCheckbutton", background=COLORS["surface"], foreground=COLORS["ink"], font=(FONT, 9), padding=(0, 6), indicatormargin=(0, 0, 10, 0))
+        style.map("Modern.TCheckbutton", background=[("active", COLORS["surface"])], foreground=[("disabled", COLORS["muted"]), ("active", COLORS["green_dark"])])
+        style.layout("ComboboxPopdownFrame", [("Modern.field", {"sticky": "nswe"})])
+        style.configure("ComboboxPopdownFrame", background=COLORS["surface"], padding=(8, 6), borderwidth=0, relief="flat")
+        for key, value in {"font": (FONT, 11), "background": COLORS["surface"], "foreground": COLORS["ink"], "selectBackground": COLORS["mint"], "selectForeground": COLORS["green_dark"], "borderWidth": 0, "highlightThickness": 0, "activeStyle": "none"}.items():
+            self.option_add(f"*TCombobox*Listbox.{key}", value)
+        button_palettes = {
+            "primary": (COLORS["green"], COLORS["green_dark"], "#ffffff", COLORS["green"]),
+            "secondary": (COLORS["surface"], "#edf2f8", COLORS["ink"], COLORS["line"]),
+            "danger": ("#fff0f2", "#fce0e6", COLORS["red"], "#f5dbe1"),
+            "soft": (COLORS["mint"], "#cfebe4", COLORS["green_dark"], COLORS["mint"]),
+            "nav": (COLORS["navy_soft"], "#2d4461", "#d7e6f5", COLORS["navy_soft"]),
+        }
+        for variant, (normal, active, foreground, border) in button_palettes.items():
+            for state, fill, outline in (("normal", normal, border), ("active", active, active), ("focus", normal, COLORS["green"]), ("disabled", "#edf1f6", "#e2e8f1")):
+                images[f"{variant}.{state}"] = self._field_image(fill, outline)
+            element = f"Modern.{variant}.button"
+            style.element_create(element, "image", images[f"{variant}.normal"], ("disabled", images[f"{variant}.disabled"]), ("pressed", images[f"{variant}.active"]), ("active", images[f"{variant}.active"]), ("focus", images[f"{variant}.focus"]), border=7, sticky="nswe")
+            name = f"{variant}.TButton"
+            style.layout(name, [(element, {"sticky": "nswe", "children": [("Button.padding", {"sticky": "nswe", "children": [("Button.label", {"sticky": "nswe"})]})]})])
+            style.configure(name, foreground=foreground, background=COLORS["surface"], padding=(14, 9), font=(FONT, 9, "bold" if variant == "primary" else "normal"), anchor="center")
+            style.map(name, foreground=[("disabled", "#8e9cb0"), ("!disabled", foreground)])
+
+    def _combobox(self, parent: tk.Misc, **kwargs: Any) -> ttk.Combobox:
+        kwargs.setdefault("font", (FONT, 10))
+        return ttk.Combobox(parent, **kwargs)
 
     def _build_shell(self) -> None:
-        self.sidebar = tk.Frame(self, bg=COLORS["navy"], width=245)
+        self.sidebar = tk.Frame(self, bg=COLORS["navy"], width=224)
         self.sidebar.grid(row=0, column=0, sticky="ns")
         self.sidebar.grid_propagate(False)
         self.main = tk.Frame(self, bg=COLORS["bg"])
@@ -719,30 +833,33 @@ class DesktopClient(tk.Tk):
 
     def _build_sidebar(self) -> None:
         brand = tk.Frame(self.sidebar, bg=COLORS["navy"])
-        brand.pack(fill="x", padx=18, pady=(28, 25))
+        brand.pack(fill="x", padx=16, pady=(24, 26))
         if self.sidebar_logo_image is not None:
-            tk.Label(brand, image=self.sidebar_logo_image, bg=COLORS["navy"], bd=0).pack(side="left", padx=(0, 10))
+            badge = tk.Canvas(brand, width=68, height=68, bg=COLORS["navy"], bd=0, highlightthickness=0)
+            badge.pack(side="left", padx=(0, 10))
+            badge.create_image(34, 34, image=self.sidebar_logo_image)
         else:
             mark = tk.Canvas(brand, width=29, height=30, bg=COLORS["navy"], highlightthickness=0)
             mark.pack(side="left", padx=(0, 10))
             mark.create_polygon(3, 25, 8, 25, 13, 9, 9, 9, fill=COLORS["lime"], outline="")
             mark.create_polygon(11, 25, 16, 25, 22, 3, 18, 3, fill=COLORS["lime"], outline="")
             mark.create_polygon(19, 25, 24, 25, 28, 12, 24, 12, fill=COLORS["lime"], outline="")
-        tk.Label(brand, text="算力调度台", bg=COLORS["navy"], fg="#f3fff9", font=(FONT, 15, "bold")).pack(anchor="w")
-        tk.Label(brand, text="GPU ORCHESTRATOR", bg=COLORS["navy"], fg="#79a495", font=(MONO, 8)).pack(anchor="w", pady=(3, 0))
+        tk.Label(brand, text="算力调度台", bg=COLORS["navy"], fg="#f3fff9", font=(FONT, 13, "bold")).pack(anchor="w", pady=(8, 0))
+        tk.Label(brand, text="GPU ORCHESTRATOR", bg=COLORS["navy"], fg="#9bacc3", font=(MONO, 7)).pack(anchor="w", pady=(4, 0))
 
-        server = tk.Frame(self.sidebar, bg="#193c35", highlightbackground="#285449", highlightthickness=1)
-        server.pack(fill="x", padx=18, pady=(0, 28))
-        tk.Label(server, text="监控概览", bg="#193c35", fg="#78a094", font=(MONO, 9)).pack(anchor="w", padx=14, pady=(14, 7))
-        tk.Label(server, textvariable=self.monitor_summary, bg="#193c35", fg="#ffffff", font=(FONT, 11, "bold"), anchor="w").pack(fill="x", padx=14)
-        tk.Label(server, text="多服务器资源实时同步", bg="#193c35", fg="#8aa99f", font=(FONT, 9), anchor="w").pack(fill="x", padx=14, pady=(5, 10))
-        state_row = tk.Frame(server, bg="#193c35")
+        server = tk.Frame(self.sidebar, bg="#18283e", highlightbackground="#2a3b53", highlightthickness=1)
+        server.pack(fill="x", padx=16, pady=(0, 26))
+        tk.Label(server, text="WORKSPACE / 监控概览", bg="#18283e", fg=COLORS["nav_text"], font=(FONT, 8)).pack(anchor="w", padx=13, pady=(14, 8))
+        tk.Label(server, textvariable=self.monitor_summary, bg="#18283e", fg="#ffffff", font=(FONT, 10, "bold"), anchor="w").pack(fill="x", padx=13)
+        state_row = tk.Frame(server, bg="#18283e")
         state_row.pack(fill="x", padx=14, pady=(0, 14))
-        self.connection_dot = tk.Canvas(state_row, width=9, height=9, bg="#193c35", highlightthickness=0)
+        self.connection_dot = tk.Canvas(state_row, width=9, height=9, bg="#18283e", highlightthickness=0)
         self.connection_dot.pack(side="left", padx=(0, 7))
         self.connection_dot.create_oval(1, 1, 8, 8, fill=COLORS["red"], outline="")
-        tk.Label(state_row, textvariable=self.connection_text, bg="#193c35", fg="#8fe4c2", font=(FONT, 9)).pack(side="left")
-        tk.Button(server, text="服务器管理", command=self.open_server_manager, relief="flat", bd=0, bg="#235047", fg="#bde9d7", activebackground="#2e6257", activeforeground="#ffffff", font=(FONT, 9), pady=5).pack(fill="x", padx=11, pady=(0, 11))
+        tk.Label(state_row, textvariable=self.connection_text, bg="#18283e", fg="#88d9c5", font=(FONT, 8)).pack(side="left")
+        self._button(server, "服务器管理  →", self.open_server_manager, "nav").pack(fill="x", padx=11, pady=(0, 11))
+
+        tk.Label(self.sidebar, text="工作台", bg=COLORS["navy"], fg="#627891", font=(FONT, 8), anchor="w").pack(fill="x", padx=28, pady=(0, 8))
 
         self.nav_buttons: dict[str, tk.Button] = {}
         for view, label, symbol in (
@@ -760,49 +877,54 @@ class DesktopClient(tk.Tk):
                 bd=0,
                 anchor="w",
                 padx=14,
-                pady=11,
+                pady=13,
                 bg=COLORS["navy"],
-                fg="#8da9a0",
+                fg=COLORS["nav_text"],
                 activebackground=COLORS["navy_soft"],
                 activeforeground="#f7fff9",
                 font=(FONT, 11),
+                cursor="hand2",
+                highlightthickness=0,
             )
             button.pack(fill="x", padx=12, pady=2)
             self.nav_buttons[view] = button
 
         bottom = tk.Frame(self.sidebar, bg=COLORS["navy"])
         bottom.pack(side="bottom", fill="x", padx=18, pady=18)
-        tip = tk.Frame(bottom, bg="#16372f", highlightbackground="#2b5146", highlightthickness=1)
+        tip = tk.Frame(bottom, bg="#18283e", highlightbackground="#2a3b53", highlightthickness=1)
         tip.pack(fill="x", pady=(0, 21))
-        tk.Label(tip, text="✦", bg="#16372f", fg=COLORS["lime"], font=(FONT, 15)).pack(side="left", anchor="n", padx=(10, 6), pady=11)
-        tk.Label(tip, text="调度策略\n空闲优先 · 紧急任务按显存与\nTensor 速度择卡", justify="left", bg="#16372f", fg="#9dc1b4", font=(FONT, 9), padx=0, pady=10).pack(side="left")
-        tk.Label(bottom, text="NATIVE DESKTOP CLIENT · v0.2", bg=COLORS["navy"], fg="#52786c", font=(MONO, 8)).pack(anchor="w")
+        tk.Label(tip, text="调度策略", bg="#18283e", fg="#d5e1f0", font=(FONT, 9, "bold")).pack(anchor="w", padx=13, pady=(13, 5))
+        tk.Label(tip, text="空闲优先 · 按显存与\nTensor 基准速度择卡", justify="left", bg="#18283e", fg=COLORS["nav_text"], font=(FONT, 9)).pack(anchor="w", padx=13, pady=(0, 13))
+        tk.Label(bottom, text="GPU ORCHESTRATOR / DESKTOP", bg=COLORS["navy"], fg="#627891", font=(MONO, 8)).pack(anchor="w")
 
     def _build_main(self) -> None:
-        topbar = tk.Frame(self.main, bg=COLORS["bg"], height=94)
-        topbar.pack(fill="x", padx=36, pady=(0, 3))
+        topbar = tk.Frame(self.main, bg=COLORS["bg"], height=120)
+        topbar.pack(fill="x", padx=28, pady=(0, 4))
         topbar.pack_propagate(False)
         heading = tk.Frame(topbar, bg=COLORS["bg"])
         heading.pack(side="left", anchor="center")
-        tk.Label(heading, textvariable=self.header_kicker, bg=COLORS["bg"], fg="#8a9993", font=(MONO, 8)).pack(anchor="w")
-        tk.Label(heading, textvariable=self.header_title, bg=COLORS["bg"], fg=COLORS["ink"], font=(FONT, 24, "bold")).pack(anchor="w", pady=(5, 0))
+        tk.Label(heading, textvariable=self.header_kicker, bg=COLORS["bg"], fg="#71839c", font=(MONO, 8)).pack(anchor="w")
+        tk.Label(heading, textvariable=self.header_title, bg=COLORS["bg"], fg=COLORS["ink"], font=(FONT, 23, "bold")).pack(anchor="w", pady=(4, 2))
+        tk.Label(heading, textvariable=self.header_description, bg=COLORS["bg"], fg=COLORS["muted"], font=(FONT, 9)).pack(anchor="w")
         actions = tk.Frame(topbar, bg=COLORS["bg"])
         actions.pack(side="right", anchor="center")
-        tk.Label(actions, textvariable=self.last_sync, bg=COLORS["bg"], fg="#8a9893", font=(MONO, 9)).pack(side="left", padx=(0, 12))
-        tk.Button(actions, text="↻", command=self.manual_refresh, relief="flat", bd=0, bg=COLORS["bg"], fg="#788681", activebackground=COLORS["bg"], font=(FONT, 19)).pack(side="left", padx=(0, 10))
-        self.connect_button = tk.Button(actions, text="服务器管理  →", command=self.open_server_manager, relief="flat", bd=0, bg=COLORS["green"], fg="#ffffff", activebackground=COLORS["green_dark"], activeforeground="#ffffff", font=(FONT, 10, "bold"), padx=15, pady=9)
+        buttons = tk.Frame(actions, bg=COLORS["bg"])
+        buttons.pack(anchor="e")
+        self._button(buttons, "↻  刷新", self.manual_refresh).pack(side="left", padx=(0, 8))
+        self.connect_button = self._button(buttons, "服务器管理  →", self.open_server_manager, "primary")
         self.connect_button.pack(side="left")
+        tk.Label(actions, textvariable=self.last_sync, bg=COLORS["bg"], fg=COLORS["muted"], font=(MONO, 8)).pack(anchor="e", pady=(8, 0))
 
         self.content = tk.Frame(self.main, bg=COLORS["bg"])
-        self.content.pack(fill="both", expand=True, padx=36, pady=(0, 22))
+        self.content.pack(fill="both", expand=True, padx=28, pady=(0, 16))
         self.views: dict[str, tk.Frame] = {}
         self._build_dashboard()
         self._build_queue()
         self._build_benchmarks()
         self._build_logs()
         self._build_settings()
-        self.status_bar = tk.Label(self.main, textvariable=self.status_var, bg="#eaf1ed", fg="#6e8077", anchor="w", padx=12, pady=5, font=(FONT, 9))
-        self.status_bar.pack(fill="x", side="bottom")
+        self.status_bar = tk.Label(self.main, textvariable=self.status_var, bg="#e9eef5", fg=COLORS["muted"], anchor="w", padx=28, pady=6, font=(FONT, 9))
+        self.status_bar.pack(fill="x", side="bottom", before=self.content)
 
     def _new_view(self, name: str) -> tk.Frame:
         frame = tk.Frame(self.content, bg=COLORS["bg"])
@@ -812,66 +934,136 @@ class DesktopClient(tk.Tk):
     def _card(self, parent: tk.Misc, **kwargs: Any) -> tk.Frame:
         return tk.Frame(parent, bg=COLORS["surface"], highlightbackground=COLORS["line"], highlightthickness=1, bd=0, **kwargs)
 
-    def _entry(self, parent: tk.Misc, **kwargs: Any) -> tk.Entry:
-        options: dict[str, Any] = {
-            "bg": COLORS["surface_soft"],
-            "fg": COLORS["ink"],
-            "insertbackground": COLORS["green_dark"],
-            "selectbackground": COLORS["mint"],
-            "selectforeground": COLORS["green_dark"],
-            "disabledbackground": "#eef3f0",
-            "disabledforeground": "#9aa8a1",
-            "relief": "flat",
-            "bd": 0,
-            "highlightthickness": 1,
-            "highlightbackground": COLORS["line"],
-            "highlightcolor": COLORS["green"],
-            "font": (FONT, 10),
-        }
-        options.update(kwargs)
-        return tk.Entry(parent, **options)
+    def _button(self, parent: tk.Misc, text: str, command: Any = None, variant: str = "secondary", **kwargs: Any) -> ttk.Button:
+        name = f"{parent.cget('bg')[1:]}.{variant}.TButton"
+        ttk.Style(self).configure(name, background=parent.cget("bg"))
+        kwargs.setdefault("width", 0)
+        return ttk.Button(parent, text=text, command=command, style=name, cursor="hand2", takefocus=True, **kwargs)
 
-    def _spinbox(self, parent: tk.Misc, **kwargs: Any) -> tk.Spinbox:
-        options: dict[str, Any] = {
-            "bg": COLORS["surface_soft"],
-            "fg": COLORS["ink"],
-            "buttonbackground": COLORS["surface_soft"],
-            "activebackground": COLORS["mint"],
-            "insertbackground": COLORS["green_dark"],
-            "selectbackground": COLORS["mint"],
-            "selectforeground": COLORS["green_dark"],
-            "disabledbackground": "#eef3f0",
-            "disabledforeground": "#9aa8a1",
-            "relief": "flat",
-            "bd": 0,
-            "highlightthickness": 1,
-            "highlightbackground": COLORS["line"],
-            "highlightcolor": COLORS["green"],
-            "font": (FONT, 10),
-        }
-        options.update(kwargs)
-        return tk.Spinbox(parent, **options)
+    def _button_variant(self, button: ttk.Button, variant: str) -> None:
+        name = f"{button.master.cget('bg')[1:]}.{variant}.TButton"
+        ttk.Style(self).configure(name, background=button.master.cget("bg"))
+        button.configure(style=name)
 
-    def _checkbutton(self, parent: tk.Misc, **kwargs: Any) -> tk.Checkbutton:
-        options: dict[str, Any] = {
-            "bg": COLORS["surface"],
-            "fg": COLORS["muted"],
-            "activebackground": COLORS["surface"],
-            "activeforeground": COLORS["green_dark"],
-            "selectcolor": COLORS["mint"],
-            "disabledforeground": "#a2afa9",
-            "highlightthickness": 0,
-            "relief": "flat",
-            "bd": 0,
-            "font": (FONT, 9),
-            "anchor": "w",
-        }
-        options.update(kwargs)
-        return tk.Checkbutton(parent, **options)
+    def _dialog(self, title: str, kicker: str, description: str, parent: tk.Misc | None = None, size: tuple[int, int] = (760, 640), scroll: bool = False, card: bool = True, modal: bool = True) -> tuple[tk.Toplevel, tk.Frame, tk.Frame]:
+        owner = parent or self
+        dialog = tk.Toplevel(owner)
+        dialog.title(title)
+        dialog.configure(bg=COLORS["bg"])
+        dialog.transient(owner)
+        if modal:
+            dialog.grab_set()
+        scale = self.winfo_fpixels("1i") / 96
+        width = min(round(size[0] * scale), self.winfo_screenwidth() - 64)
+        height = min(round(size[1] * scale), self.winfo_screenheight() - 96)
+        x = max(16, min(self.winfo_screenwidth() - width - 16, owner.winfo_rootx() + (owner.winfo_width() - width) // 2))
+        y = max(16, min(self.winfo_screenheight() - height - 48, owner.winfo_rooty() + (owner.winfo_height() - height) // 2))
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        dialog.minsize(min(width, round(min(size[0], 640) * scale)), min(height, round(min(size[1], 360) * scale)))
+        header = tk.Frame(dialog, bg=COLORS["surface"])
+        header.pack(fill="x")
+        tk.Frame(header, bg=COLORS["green"], height=3).pack(fill="x")
+        heading = tk.Frame(header, bg=COLORS["surface"])
+        heading.pack(fill="x", padx=24, pady=(18, 6))
+        if self.sidebar_logo_image is not None:
+            if not hasattr(self, "dialog_logo_image"):
+                self.dialog_logo_image = self.app_logo_image.subsample(max(1, self.app_logo_image.width() // 44))
+            tk.Label(heading, image=self.dialog_logo_image, bg=COLORS["surface"], bd=0, padx=4, pady=4).pack(side="left", padx=(0, 14))
+        words = tk.Frame(heading, bg=COLORS["surface"])
+        words.pack(side="left", fill="x", expand=True)
+        tk.Label(words, text=kicker, bg=COLORS["surface"], fg=COLORS["muted"], font=(MONO, 8)).pack(anchor="w")
+        tk.Label(words, text=title, bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 18, "bold"), anchor="w").pack(fill="x", pady=(3, 0))
+        hint = tk.Label(header, text=description, bg=COLORS["surface"], fg=COLORS["muted"], font=(FONT, 9), anchor="w", justify="left", width=1)
+        hint.pack(fill="x", padx=24, pady=(2, 18))
+        header.bind("<Configure>", lambda event: hint.configure(wraplength=max(1, event.width - 50)))
+        tk.Frame(header, bg=COLORS["line"], height=1).pack(fill="x")
+        footer_shell = tk.Frame(dialog, bg=COLORS["surface"])
+        footer_shell.pack(side="bottom", fill="x")
+        tk.Frame(footer_shell, bg=COLORS["line"], height=1).pack(fill="x")
+        footer = tk.Frame(footer_shell, bg=COLORS["surface"])
+        footer.pack(fill="x", padx=24, pady=16)
+        shell = tk.Frame(dialog, bg=COLORS["bg"])
+        shell.pack(fill="both", expand=True, padx=24, pady=20)
+        if scroll:
+            canvas = tk.Canvas(shell, bg=COLORS["bg"], bd=0, highlightthickness=0)
+            scrollbar = ttk.Scrollbar(shell, orient="vertical", command=canvas.yview)
+            canvas.configure(yscrollcommand=scrollbar.set)
+            canvas.pack(side="left", fill="both", expand=True)
+            scrollbar.pack(side="right", fill="y", padx=(10, 0))
+            content = self._card(canvas) if card else tk.Frame(canvas, bg=COLORS["bg"])
+            window = canvas.create_window((0, 0), window=content, anchor="nw")
+            content.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+            canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=event.width))
+            def wheel(event: Any) -> None:
+                if hasattr(event.widget, "winfo_class") and event.widget.winfo_class() in ("Listbox", "Text", "TCombobox"):
+                    return
+                if content in self._widget_ancestors(event.widget) or event.widget == canvas:
+                    canvas.yview_scroll(-3 if getattr(event, "delta", 0) > 0 or getattr(event, "num", None) == 4 else 3, "units")
+            for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                dialog.bind(sequence, wheel, add="+")
+        else:
+            content = self._card(shell) if card else tk.Frame(shell, bg=COLORS["bg"])
+            content.pack(fill="both", expand=True)
+        if card:
+            content.configure(pady=14)
+        dialog.ui_header, dialog.ui_content, dialog.ui_footer = header, content, footer
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        return dialog, content, footer
+
+    def _message(self, kind: str, title: str, message: str, parent: tk.Misc | None = None) -> bool:
+        """Keep validation and confirmation dialogs in the same visual system."""
+        previous_grab = self.grab_current()
+        dialog, content, footer = self._dialog(title, "CONFIRMATION" if kind == "question" else "WORKSPACE NOTICE", "请确认后继续操作。" if kind == "question" else "算力调度台 · 操作提示", parent=parent, size=(600, 360))
+        color = COLORS["red"] if kind == "error" else COLORS["amber"] if kind in ("warning", "question") else COLORS["green"]
+        dialog.ui_header.winfo_children()[0].configure(bg=color)
+        tk.Label(content, text="!" if kind != "info" else "i", bg=COLORS["surface"], fg=color, font=(FONT, 22, "bold")).pack(side="left", anchor="n", padx=(18, 10), pady=18)
+        text = tk.Text(content, bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 10), bd=0, highlightthickness=0, wrap="word", width=1, height=1, padx=10, pady=18)
+        text.pack(side="left", fill="both", expand=True, padx=(0, 18))
+        scrollbar = ttk.Scrollbar(content, orient="vertical", command=text.yview)
+        scrollbar.pack(side="right", fill="y")
+        text.configure(yscrollcommand=scrollbar.set)
+        text.insert("1.0", str(message))
+        text.configure(state="disabled")
+        result = False
+        def choose(accepted: bool) -> None:
+            nonlocal result
+            result = accepted
+            dialog.destroy()
+        self._button(footer, "确认" if kind == "question" else "知道了", lambda: choose(True), "danger" if kind == "question" and "删除" in title else "primary").pack(side="right")
+        if kind == "question":
+            cancel = self._button(footer, "取消", lambda: choose(False))
+            cancel.pack(side="right", padx=(0, 10))
+            cancel.focus_set()
+        self.wait_window(dialog)
+        if previous_grab is not None:
+            try:
+                if previous_grab.winfo_exists():
+                    previous_grab.grab_set()
+            except tk.TclError:
+                pass
+        return result
+
+    def _reflow_cards(self, parent: tk.Misc, cards: list[tk.Misc], width: int, minimum: int, limit: int) -> None:
+        """Reposition existing cards without rebuilding their live widgets."""
+        scale = self.winfo_fpixels("1i") / 96
+        columns = max(1, min(limit, int(width / (minimum * scale))))
+        for column in range(limit):
+            parent.columnconfigure(column, weight=1 if column < columns else 0, minsize=0, uniform="cards" if column < columns else "")
+        for index, card in enumerate(cards):
+            card.grid(row=index // columns, column=index % columns, sticky="nsew", padx=(0 if index % columns == 0 else 10, 0), pady=(0, 10))
+
+    def _entry(self, parent: tk.Misc, **kwargs: Any) -> ttk.Entry:
+        return ttk.Entry(parent, style="Modern.TEntry", font=(FONT, 10), **kwargs)
+
+    def _spinbox(self, parent: tk.Misc, **kwargs: Any) -> ttk.Spinbox:
+        return ttk.Spinbox(parent, style="Modern.TSpinbox", font=(FONT, 10), **kwargs)
+
+    def _checkbutton(self, parent: tk.Misc, **kwargs: Any) -> ttk.Checkbutton:
+        return ttk.Checkbutton(parent, style="Modern.TCheckbutton", cursor="hand2", **kwargs)
 
     def _section_title(self, parent: tk.Misc, kicker: str, title: str) -> tk.Frame:
         row = tk.Frame(parent, bg=COLORS["bg"])
-        tk.Label(row, text=kicker, bg=COLORS["bg"], fg="#84a49a", font=(MONO, 8)).pack(anchor="w")
+        tk.Label(row, text=kicker, bg=COLORS["bg"], fg="#71839c", font=(MONO, 8)).pack(anchor="w")
         tk.Label(row, text=title, bg=COLORS["bg"], fg=COLORS["ink"], font=(FONT, 15, "bold")).pack(anchor="w", pady=(4, 0))
         return row
 
@@ -893,9 +1085,10 @@ class DesktopClient(tk.Tk):
         self.bind_all("<Button-5>", self._scroll_dashboard)
         body = self.dashboard_scroll_frame
         self.metric_vars: dict[str, tk.StringVar] = {}
-        self.metric_bars: dict[str, ttk.Progressbar] = {}
+        self.metric_bars: dict[str, ResourceBar] = {}
         metrics = tk.Frame(body, bg=COLORS["bg"])
         metrics.pack(fill="x")
+        metric_cards: list[tk.Frame] = []
         for index, (key, title, code, color, detail) in enumerate((
             ("cpu", "CPU 使用率", "CPU", COLORS["green"], "负载 —"),
             ("ram", "系统内存", "RAM", COLORS["blue"], "— / —"),
@@ -903,8 +1096,10 @@ class DesktopClient(tk.Tk):
             ("disk", "主目录存储", "HOME", COLORS["amber"], "— 可用"),
         )):
             card = self._card(metrics)
+            metric_cards.append(card)
+            tk.Frame(card, bg=color, height=3).pack(fill="x")
             card.grid(row=0, column=index, sticky="nsew", padx=(0 if index == 0 else 7, 0))
-            metrics.columnconfigure(index, weight=1)
+            metrics.columnconfigure(index, weight=1, uniform="cards")
             head = tk.Frame(card, bg=COLORS["surface"])
             head.pack(fill="x", padx=17, pady=(16, 0))
             tk.Label(head, text=title, bg=COLORS["surface"], fg=COLORS["muted"], font=(FONT, 9, "bold")).pack(side="left")
@@ -914,10 +1109,13 @@ class DesktopClient(tk.Tk):
             self.metric_vars[key] = value_var
             self.metric_vars[key + "_detail"] = detail_var
             tk.Label(card, textvariable=value_var, bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 25, "bold")).pack(anchor="w", padx=17, pady=(9, 0))
-            tk.Label(card, textvariable=detail_var, bg=COLORS["surface"], fg="#88958f", font=(FONT, 8)).pack(anchor="w", padx=17, pady=(5, 0))
-            bar = ttk.Progressbar(card, style=f"{'Green' if key == 'cpu' else 'Blue' if key == 'ram' else 'Purple' if key == 'gpu' else 'Amber'}.Horizontal.TProgressbar", maximum=100, value=0)
+            detail_label = tk.Label(card, textvariable=detail_var, bg=COLORS["surface"], fg=COLORS["muted"], font=(FONT, 8), width=1, anchor="w", justify="left")
+            detail_label.pack(fill="x", padx=17, pady=(5, 0))
+            card.bind("<Configure>", lambda event, label=detail_label: label.configure(wraplength=max(1, event.width - 36)))
+            bar = ResourceBar(card, style=f"{'Green' if key == 'cpu' else 'Blue' if key == 'ram' else 'Purple' if key == 'gpu' else 'Amber'}.Horizontal.TProgressbar", maximum=100, value=0)
             bar.pack(fill="x", padx=17, pady=(11, 16))
             self.metric_bars[key] = bar
+        metrics.bind("<Configure>", lambda event: self._reflow_cards(metrics, metric_cards, event.width, 190, 4))
 
         gpu_heading = tk.Frame(body, bg=COLORS["bg"])
         gpu_heading.pack(fill="x", pady=(29, 12))
@@ -935,24 +1133,24 @@ class DesktopClient(tk.Tk):
         self.activity_card.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
         self.storage_card = self._card(lower)
         self.storage_card.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
-        tk.Label(self.activity_card, text="QUEUE ACTIVITY", bg=COLORS["surface"], fg="#84a49a", font=(MONO, 8)).pack(anchor="w", padx=19, pady=(17, 0))
+        tk.Label(self.activity_card, text="QUEUE ACTIVITY", bg=COLORS["surface"], fg="#71839c", font=(MONO, 8)).pack(anchor="w", padx=19, pady=(17, 0))
         activity_head = tk.Frame(self.activity_card, bg=COLORS["surface"])
         activity_head.pack(fill="x", padx=19)
         tk.Label(activity_head, text="队列动态", bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 14, "bold")).pack(side="left", pady=(4, 10))
-        tk.Button(activity_head, text="查看全部 →", command=lambda: self._show_view("queue"), bg=COLORS["surface"], fg=COLORS["green_dark"], relief="flat", bd=0, font=(FONT, 9, "bold")).pack(side="right")
+        self._button(activity_head, text="查看全部 →", command=lambda: self._show_view("queue"), variant='secondary').pack(side="right")
         self.activity_body = tk.Frame(self.activity_card, bg=COLORS["surface"])
         self.activity_body.pack(fill="both", expand=True, padx=19, pady=(0, 14))
-        tk.Label(self.storage_card, text="HOME STORAGE", bg=COLORS["surface"], fg="#84a49a", font=(MONO, 8)).pack(anchor="w", padx=19, pady=(17, 0))
+        tk.Label(self.storage_card, text="HOME STORAGE", bg=COLORS["surface"], fg="#71839c", font=(MONO, 8)).pack(anchor="w", padx=19, pady=(17, 0))
         storage_head = tk.Frame(self.storage_card, bg=COLORS["surface"])
         storage_head.pack(fill="x", padx=19)
         tk.Label(storage_head, text="主目录空间", bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 14, "bold")).pack(side="left", pady=(4, 10))
         self.storage_path_var = tk.StringVar(value="~")
-        tk.Label(storage_head, textvariable=self.storage_path_var, bg=COLORS["surface"], fg="#81928a", font=(MONO, 8)).pack(side="right", pady=(7, 10))
+        tk.Label(storage_head, textvariable=self.storage_path_var, bg=COLORS["surface"], fg="#6b7b92", font=(MONO, 8)).pack(side="right", pady=(7, 10))
         self.storage_body = tk.Frame(self.storage_card, bg=COLORS["surface"])
         self.storage_body.pack(fill="both", expand=True, padx=19, pady=(0, 14))
 
     def _scroll_dashboard(self, event: Any) -> None:
-        if self.current_view != "dashboard":
+        if self.current_view != "dashboard" or self.views["dashboard"] not in self._widget_ancestors(event.widget):
             return
         if getattr(event, "num", None) == 4:
             delta = -3
@@ -965,45 +1163,52 @@ class DesktopClient(tk.Tk):
     def _build_queue(self) -> None:
         view = self._new_view("queue")
         heading = tk.Frame(view, bg=COLORS["bg"])
-        heading.pack(fill="x", pady=(12, 20))
+        heading.pack(fill="x", pady=(0, 14))
         left = tk.Frame(heading, bg=COLORS["bg"])
         left.pack(side="left")
-        tk.Label(left, text="EXPERIMENT QUEUE", bg=COLORS["bg"], fg="#84a49a", font=(MONO, 8)).pack(anchor="w")
-        tk.Label(left, text="实验运行队列", bg=COLORS["bg"], fg=COLORS["ink"], font=(FONT, 23, "bold")).pack(anchor="w", pady=(4, 0))
-        tk.Label(left, text="按优先级、配置顺序与 GPU 基准速度自动调度。", bg=COLORS["bg"], fg="#87938e", font=(FONT, 9)).pack(anchor="w", pady=(5, 0))
-        tk.Button(heading, text="＋ 提交 .sh 实验", command=self.open_experiment_dialog, relief="flat", bd=0, bg=COLORS["green"], fg="#ffffff", activebackground=COLORS["green_dark"], font=(FONT, 10, "bold"), padx=14, pady=8).pack(side="right", anchor="n")
+        tk.Label(left, text="任务概况", bg=COLORS["bg"], fg=COLORS["ink"], font=(FONT, 12, "bold")).pack(anchor="w")
+        self._button(heading, "＋  提交 .sh 实验", self.open_experiment_dialog, "primary").pack(side="right")
         self.queue_summary_vars = {name: tk.StringVar(value="0") for name in ("queued", "running", "paused", "success", "failed")}
         summary = tk.Frame(view, bg=COLORS["bg"])
         summary.pack(fill="x", pady=(0, 13))
         for index, (key, label) in enumerate((("queued", "等待中"), ("running", "运行中"), ("paused", "暂停中"), ("success", "已完成"), ("failed", "需关注"))):
             card = self._card(summary)
             card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 6, 0))
-            summary.columnconfigure(index, weight=1)
-            tk.Label(card, text=label, bg=COLORS["surface"], fg="#86938d", font=(FONT, 9)).pack(anchor="w", padx=15, pady=(13, 0))
-            tk.Label(card, textvariable=self.queue_summary_vars[key], bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 20, "bold")).pack(anchor="w", padx=15, pady=(4, 12))
+            summary.columnconfigure(index, weight=1, uniform="summary")
+            tk.Label(card, text=label, bg=COLORS["surface"], fg="#6b7b92", font=(FONT, 9)).pack(anchor="w", padx=15, pady=(13, 0))
+            tk.Label(card, textvariable=self.queue_summary_vars[key], bg=COLORS["surface"], fg={"running": COLORS["green_dark"], "paused": COLORS["amber"], "failed": COLORS["red"]}.get(key, COLORS["ink"]), font=(FONT, 22, "bold")).pack(anchor="w", padx=15, pady=(4, 12))
         self.scheduler_notice_var = tk.StringVar(value="调度状态检查中")
-        self.scheduler_notice = tk.Label(view, textvariable=self.scheduler_notice_var, bg="#eff9f3", fg=COLORS["green_dark"], anchor="w", padx=13, pady=8, font=(FONT, 9))
+        self.scheduler_notice = tk.Label(view, textvariable=self.scheduler_notice_var, bg="#eaf7f3", fg=COLORS["green_dark"], anchor="w", padx=13, pady=8, font=(FONT, 9))
         self.scheduler_notice.pack(fill="x", pady=(0, 13))
         controls = tk.Frame(view, bg=COLORS["bg"])
-        controls.pack(fill="x", pady=(0, 10))
-        tk.Button(controls, text="查看日志", command=self.open_selected_log, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["green_dark"], font=(FONT, 9, "bold"), padx=12, pady=7).pack(side="left")
-        tk.Button(controls, text="编辑选中任务", command=self.edit_selected_experiment, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["green_dark"], font=(FONT, 9), padx=12, pady=7).pack(side="left", padx=8)
-        tk.Button(controls, text="重新等待选中任务", command=self.retry_selected, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["green_dark"], font=(FONT, 9), padx=12, pady=7).pack(side="left", padx=8)
-        tk.Button(controls, text="暂停 / 继续任务", command=self.toggle_selected_pause, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["green_dark"], font=(FONT, 9), padx=12, pady=7).pack(side="left")
-        tk.Button(controls, text="暂停全部任务", command=self.pause_all_tasks, relief="flat", bd=0, bg="#fff5e8", fg=COLORS["amber"], font=(FONT, 9), padx=12, pady=7).pack(side="left", padx=8)
-        tk.Button(controls, text="全部重新等待", command=self.resume_all_tasks, relief="flat", bd=0, bg=COLORS["mint"], fg=COLORS["green_dark"], font=(FONT, 9), padx=12, pady=7).pack(side="left")
-        tk.Button(controls, text="中断选中任务", command=self.cancel_selected, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["red"], font=(FONT, 9), padx=12, pady=7).pack(side="left", padx=(8, 0))
-        tk.Button(controls, text="删除选中任务", command=self.delete_selected_experiment, relief="flat", bd=0, bg="#fff1ef", fg=COLORS["red"], font=(FONT, 9), padx=12, pady=7).pack(side="left", padx=8)
+        controls.pack(fill="x", pady=(0, 12))
+        selected_row = tk.Frame(controls, bg=COLORS["bg"])
+        selected_row.pack(fill="x")
+        tk.Label(selected_row, text="选中任务", bg=COLORS["bg"], fg=COLORS["muted"], font=(FONT, 8), width=9, anchor="w").pack(side="left")
+        for label, command, variant in (
+            ("查看日志", self.open_selected_log, "secondary"),
+            ("编辑", self.edit_selected_experiment, "secondary"),
+            ("重新等待", self.retry_selected, "secondary"),
+            ("暂停 / 继续", self.toggle_selected_pause, "soft"),
+            ("中断", self.cancel_selected, "danger"),
+            ("删除", self.delete_selected_experiment, "danger"),
+        ):
+            self._button(selected_row, label, command, variant).pack(side="left", padx=(0, 6))
+        batch_row = tk.Frame(controls, bg=COLORS["bg"])
+        batch_row.pack(fill="x", pady=(8, 0))
+        tk.Label(batch_row, text="全部任务", bg=COLORS["bg"], fg=COLORS["muted"], font=(FONT, 8), width=9, anchor="w").pack(side="left")
+        self._button(batch_row, "暂停全部任务", self.pause_all_tasks).pack(side="left", padx=(0, 6))
+        self._button(batch_row, "全部重新等待", self.resume_all_tasks).pack(side="left")
         table_card = self._card(view)
         table_card.pack(fill="both", expand=True)
         toolbar = tk.Frame(table_card, bg=COLORS["surface"])
         toolbar.pack(fill="x", padx=14, pady=12)
-        self.filter_buttons: dict[str, tk.Button] = {}
+        self.filter_buttons: dict[str, ttk.Button] = {}
         for key, label in (("all", "全部"), ("queued", "等待"), ("running", "运行中"), ("paused", "暂停"), ("success", "已完成"), ("failed", "需关注")):
-            button = tk.Button(toolbar, text=label, command=lambda current=key: self.set_queue_filter(current), relief="flat", bd=0, bg=COLORS["mint"] if key == "all" else COLORS["surface"], fg=COLORS["green_dark"] if key == "all" else COLORS["muted"], font=(FONT, 9, "bold" if key == "all" else "normal"), padx=10, pady=5)
+            button = self._button(toolbar, label, lambda current=key: self.set_queue_filter(current), "soft" if key == "all" else "secondary")
             button.pack(side="left", padx=(0, 5))
             self.filter_buttons[key] = button
-        tk.Label(toolbar, text="数字越小优先级越高", bg=COLORS["surface"], fg="#9aa59f", font=(FONT, 8)).pack(side="right")
+        tk.Label(toolbar, text="数字越小优先级越高", bg=COLORS["surface"], fg="#7a8ba2", font=(FONT, 8)).pack(side="right")
         table_frame = tk.Frame(table_card, bg=COLORS["surface"])
         table_frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         columns = ("name", "server", "status", "priority", "strategy", "gpu", "memory")
@@ -1012,16 +1217,20 @@ class DesktopClient(tk.Tk):
         widths = {"name": 220, "server": 130, "status": 100, "priority": 75, "strategy": 150, "gpu": 180, "memory": 105}
         for column in columns:
             self.queue_tree.heading(column, text=headings[column])
-            self.queue_tree.column(column, width=widths[column], anchor="w")
+            self.queue_tree.column(column, width=widths[column], minwidth=widths[column], anchor="w")
         self.queue_tree.tag_configure("running", foreground=COLORS["green_dark"])
-        self.queue_tree.tag_configure("success", foreground="#4b944f")
+        self.queue_tree.tag_configure("success", foreground="#6b7b92")
         self.queue_tree.tag_configure("failed", foreground=COLORS["red"])
         self.queue_tree.tag_configure("paused", foreground=COLORS["amber"])
         self.queue_tree.tag_configure("waiting_memory", foreground="#bd504a")
-        self.queue_tree.pack(fill="both", expand=True, side="left")
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+        self.queue_tree.grid(row=0, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.queue_tree.yview)
-        scroll.pack(side="right", fill="y")
-        self.queue_tree.configure(yscrollcommand=scroll.set)
+        scroll.grid(row=0, column=1, sticky="ns")
+        horizontal = ttk.Scrollbar(table_frame, orient="horizontal", command=self.queue_tree.xview)
+        horizontal.grid(row=1, column=0, sticky="ew")
+        self.queue_tree.configure(yscrollcommand=scroll.set, xscrollcommand=horizontal.set)
         self.queue_tree.bind("<Double-1>", lambda _event: self.open_selected_log())
 
     def _build_benchmarks(self) -> None:
@@ -1042,18 +1251,18 @@ class DesktopClient(tk.Tk):
         self.bind_all("<Button-5>", self._scroll_benchmark, add="+")
         body = self.benchmark_scroll_frame
         heading = tk.Frame(body, bg=COLORS["bg"])
-        heading.pack(fill="x", pady=(12, 20))
-        tk.Label(heading, text="TENSOR BENCHMARK", bg=COLORS["bg"], fg="#84a49a", font=(MONO, 8)).pack(anchor="w")
-        tk.Label(heading, text="GPU 计算测试", bg=COLORS["bg"], fg=COLORS["ink"], font=(FONT, 23, "bold")).pack(anchor="w", pady=(4, 0))
-        tk.Label(heading, text="PyTorch CUDA 矩阵乘法实测 Tensor FP16 与 FP32 吞吐。", bg=COLORS["bg"], fg="#87938e", font=(FONT, 9)).pack(anchor="w", pady=(5, 0))
+        heading.pack(fill="x", pady=(0, 14))
+        tk.Label(heading, text="测试设备与环境", bg=COLORS["bg"], fg=COLORS["ink"], font=(FONT, 12, "bold")).pack(anchor="w")
         notice = tk.Frame(body, bg="#f2fbf6", highlightbackground="#d9eee3", highlightthickness=1)
         notice.pack(fill="x", pady=(0, 15))
-        tk.Label(notice, text="ⓘ  测试会在目标显卡上短时运行矩阵乘法；建议选择包含 PyTorch CUDA 的 Conda 环境。", bg="#f2fbf6", fg="#6f8d80", font=(FONT, 9), padx=13, pady=10).pack(anchor="w")
+        notice_label = tk.Label(notice, text="ⓘ  测试会在目标显卡上短时运行矩阵乘法；建议选择包含 PyTorch CUDA 的 Conda 环境。", bg="#f2fbf6", fg=COLORS["green_dark"], font=(FONT, 9), padx=13, pady=10, justify="left", anchor="w")
+        notice_label.pack(fill="x")
+        notice.bind("<Configure>", lambda event: notice_label.configure(wraplength=max(1, event.width - 28)))
         self.benchmark_cards = tk.Frame(body, bg=COLORS["bg"])
         self.benchmark_cards.pack(fill="x")
         history = self._card(body)
         history.pack(fill="both", expand=True, pady=(15, 0))
-        tk.Label(history, text="HISTORY", bg=COLORS["surface"], fg="#84a49a", font=(MONO, 8)).pack(anchor="w", padx=19, pady=(15, 0))
+        tk.Label(history, text="HISTORY", bg=COLORS["surface"], fg="#71839c", font=(MONO, 8)).pack(anchor="w", padx=19, pady=(15, 0))
         tk.Label(history, text="最近测试结果", bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 14, "bold")).pack(anchor="w", padx=19, pady=(4, 10))
         frame = tk.Frame(history, bg=COLORS["surface"])
         frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
@@ -1063,10 +1272,17 @@ class DesktopClient(tk.Tk):
         for col in cols:
             self.history_tree.heading(col, text=labels[col])
             self.history_tree.column(col, width=125, anchor="w")
-        self.history_tree.pack(fill="both", expand=True)
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        self.history_tree.grid(row=0, column=0, sticky="nsew")
+        history_scroll = ttk.Scrollbar(frame, orient="vertical", command=self.history_tree.yview)
+        history_scroll.grid(row=0, column=1, sticky="ns")
+        history_horizontal = ttk.Scrollbar(frame, orient="horizontal", command=self.history_tree.xview)
+        history_horizontal.grid(row=1, column=0, sticky="ew")
+        self.history_tree.configure(yscrollcommand=history_scroll.set, xscrollcommand=history_horizontal.set)
 
     def _scroll_benchmark(self, event: Any) -> None:
-        if self.current_view != "benchmarks":
+        if self.current_view != "benchmarks" or self.views["benchmarks"] not in self._widget_ancestors(event.widget):
             return
         if getattr(event, "num", None) == 4:
             delta = -3
@@ -1078,55 +1294,88 @@ class DesktopClient(tk.Tk):
 
     def _build_logs(self) -> None:
         view = self._new_view("logs")
-        heading = tk.Frame(view, bg=COLORS["bg"])
-        heading.pack(fill="x", pady=(12, 20))
-        tk.Label(heading, text="RUN LOGS", bg=COLORS["bg"], fg="#84a49a", font=(MONO, 8)).pack(anchor="w")
-        tk.Label(heading, text="运行日志", bg=COLORS["bg"], fg=COLORS["ink"], font=(FONT, 23, "bold")).pack(anchor="w", pady=(4, 0))
-        tk.Label(heading, text="日志直接读取自服务器 ~/.gpu-orchestrator/runs。", bg=COLORS["bg"], fg="#87938e", font=(FONT, 9)).pack(anchor="w", pady=(5, 0))
-        body = tk.Frame(view, bg=COLORS["bg"])
+        body = tk.PanedWindow(view, orient="horizontal", bg=COLORS["bg"], bd=0, sashwidth=12, sashrelief="flat", opaqueresize=True)
         body.pack(fill="both", expand=True)
-        body.columnconfigure(0, weight=0)
-        body.columnconfigure(1, weight=1)
         self.log_list_card = self._card(body)
-        self.log_list_card.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
+        body.add(self.log_list_card, width=260, minsize=210, stretch="never")
         self.log_view_card = self._card(body)
-        self.log_view_card.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
-        tk.Label(self.log_list_card, text="EXPERIMENTS", bg=COLORS["surface"], fg="#84a49a", font=(MONO, 8)).pack(anchor="w", padx=15, pady=(15, 0))
+        body.add(self.log_view_card, minsize=330, stretch="always")
+        tk.Label(self.log_list_card, text="EXPERIMENTS", bg=COLORS["surface"], fg="#71839c", font=(MONO, 8)).pack(anchor="w", padx=15, pady=(15, 0))
         tk.Label(self.log_list_card, text="任务列表", bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 14, "bold")).pack(anchor="w", padx=15, pady=(4, 10))
-        self.log_list_body = tk.Frame(self.log_list_card, bg=COLORS["surface"], width=280)
-        self.log_list_body.pack(fill="both", expand=True, padx=8, pady=(0, 10))
+        list_shell = tk.Frame(self.log_list_card, bg=COLORS["surface"])
+        list_shell.pack(fill="both", expand=True, padx=8, pady=(0, 10))
+        self.log_list_canvas = tk.Canvas(list_shell, bg=COLORS["surface"], bd=0, highlightthickness=0, width=240)
+        list_scroll = ttk.Scrollbar(list_shell, orient="vertical", command=self.log_list_canvas.yview)
+        self.log_list_canvas.configure(yscrollcommand=list_scroll.set)
+        self.log_list_canvas.pack(side="left", fill="both", expand=True)
+        list_scroll.pack(side="right", fill="y")
+        self.log_list_body = tk.Frame(self.log_list_canvas, bg=COLORS["surface"])
+        list_window = self.log_list_canvas.create_window((0, 0), window=self.log_list_body, anchor="nw")
+        self.log_list_body.bind("<Configure>", lambda _event: self.log_list_canvas.configure(scrollregion=self.log_list_canvas.bbox("all")))
+        def resize_list(event: Any) -> None:
+            self.log_list_canvas.itemconfigure(list_window, width=event.width)
+            for button in self.log_list_body.winfo_children():
+                if button.winfo_class() == "Button":
+                    button.configure(wraplength=max(1, event.width - 26))
+        self.log_list_canvas.bind("<Configure>", resize_list)
+        self.bind_all("<MouseWheel>", self._scroll_log_list, add="+")
+        self.bind_all("<Button-4>", self._scroll_log_list, add="+")
+        self.bind_all("<Button-5>", self._scroll_log_list, add="+")
         log_head = tk.Frame(self.log_view_card, bg=COLORS["surface"])
         log_head.pack(fill="x", padx=17, pady=(15, 8))
         self.log_title_var = tk.StringVar(value="选择一个任务")
-        tk.Label(log_head, text="TAIL OUTPUT", bg=COLORS["surface"], fg="#84a49a", font=(MONO, 8)).pack(anchor="w")
-        tk.Label(log_head, textvariable=self.log_title_var, bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 14, "bold")).pack(side="left", pady=(4, 0))
-        tk.Button(log_head, text="详情", command=self.open_full_log, relief="flat", bd=0, bg=COLORS["mint"], fg=COLORS["green_dark"], font=(FONT, 9, "bold"), padx=10, pady=5).pack(side="right", padx=(7, 0), pady=(3, 0))
-        tk.Button(log_head, text="↻ 刷新", command=self.load_selected_log, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["green_dark"], font=(FONT, 9, "bold")).pack(side="right", pady=(5, 0))
-        tk.Label(self.log_view_card, text="自动刷新最近 200 行（最多读取 24 KB）；点击“详情”加载完整日志。", bg=COLORS["surface"], fg="#9aa59f", font=(FONT, 8)).pack(anchor="w", padx=18, pady=(0, 6))
-        self.log_text = tk.Text(self.log_view_card, bg="#122c27", fg="#a6c8b7", insertbackground="#a6c8b7", relief="flat", bd=0, wrap="word", font=(MONO, 9), padx=18, pady=14)
-        self.log_text.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        log_toolbar = tk.Frame(log_head, bg=COLORS["surface"])
+        log_toolbar.pack(fill="x")
+        tk.Label(log_toolbar, text="TAIL OUTPUT", bg=COLORS["surface"], fg="#71839c", font=(MONO, 8)).pack(side="left")
+        self._button(log_toolbar, "完整日志", self.open_full_log, "soft").pack(side="right", padx=(7, 0))
+        self._button(log_toolbar, "↻  刷新", self.load_selected_log).pack(side="right")
+        log_title = tk.Label(log_head, textvariable=self.log_title_var, bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 14, "bold"), anchor="w", justify="left", width=1)
+        log_title.pack(fill="x", pady=(10, 0))
+        log_hint = tk.Label(self.log_view_card, text="自动刷新最近 200 行（最多读取 24 KB）；点击“完整日志”查看全部输出。", bg=COLORS["surface"], fg="#7a8ba2", font=(FONT, 8), anchor="w", justify="left", width=1)
+        log_hint.pack(fill="x", padx=18, pady=(0, 8))
+        self.log_view_card.bind("<Configure>", lambda event: (log_title.configure(wraplength=max(1, event.width - 38)), log_hint.configure(wraplength=max(1, event.width - 38))))
+        terminal = tk.Frame(self.log_view_card, bg=COLORS["terminal"])
+        terminal.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.log_text = tk.Text(terminal, bg=COLORS["terminal"], fg="#c4d5e9", insertbackground="#c4d5e9", selectbackground="#314969", relief="flat", bd=0, wrap="word", font=(MONO, 10), padx=18, pady=16, width=1, height=1)
+        self.log_text.pack(side="left", fill="both", expand=True)
+        log_scroll = ttk.Scrollbar(terminal, orient="vertical", command=self.log_text.yview)
+        log_scroll.pack(side="right", fill="y")
+        self.log_text.configure(yscrollcommand=log_scroll.set)
         self.log_text.insert("1.0", "选择左侧实验查看最新日志。")
         self.log_text.configure(state="disabled")
+
+    def _scroll_log_list(self, event: Any) -> None:
+        if self.current_view != "logs" or self.log_list_card not in self._widget_ancestors(event.widget):
+            return
+        delta = -3 if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0 else 3
+        self.log_list_canvas.yview_scroll(delta, "units")
+
+    def _widget_ancestors(self, widget: tk.Misc) -> list[tk.Misc]:
+        ancestors = []
+        while widget is not None:
+            ancestors.append(widget)
+            widget = getattr(widget, "master", None)
+        return ancestors
 
     def _build_settings(self) -> None:
         view = self._new_view("settings")
         heading = tk.Frame(view, bg=COLORS["bg"])
-        heading.pack(fill="x", pady=(12, 20))
-        tk.Label(heading, text="GLOBAL SETTINGS", bg=COLORS["bg"], fg="#84a49a", font=(MONO, 8)).pack(anchor="w")
-        tk.Label(heading, text="全局设置", bg=COLORS["bg"], fg=COLORS["ink"], font=(FONT, 23, "bold")).pack(anchor="w", pady=(4, 0))
-        tk.Label(heading, text="调度采样基准适用于所有已连接服务器。", bg=COLORS["bg"], fg="#87938e", font=(FONT, 9)).pack(anchor="w", pady=(5, 0))
+        heading.pack(fill="x", pady=(0, 14))
+        tk.Label(heading, text="调度偏好", bg=COLORS["bg"], fg=COLORS["ink"], font=(FONT, 12, "bold")).pack(anchor="w")
         card = self._card(view)
         card.pack(fill="x", anchor="n")
         tk.Label(card, text="GPU 调度采样", bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 14, "bold")).pack(anchor="w", padx=20, pady=(18, 4))
-        tk.Label(card, text="判断忙卡是否能接收共享任务时，显存按最近采样中的峰值占用估算，GPU 利用率按最近采样中的最高值判断。空闲卡仍按当前状态判断。", bg=COLORS["surface"], fg="#78867f", font=(FONT, 9), wraplength=780, justify="left").pack(anchor="w", padx=20, pady=(0, 15))
+        description = tk.Label(card, text="判断忙卡是否能接收共享任务时，显存按最近采样中的峰值占用估算，GPU 利用率按最近采样中的最高值判断。空闲卡仍按当前状态判断。", bg=COLORS["surface"], fg=COLORS["muted"], font=(FONT, 9), wraplength=780, justify="left", anchor="w")
+        description.pack(fill="x", padx=20, pady=(0, 15))
+        card.bind("<Configure>", lambda event: description.configure(wraplength=max(1, event.width - 42)))
         row = tk.Frame(card, bg=COLORS["surface"])
         row.pack(fill="x", padx=20, pady=(0, 18))
-        tk.Label(row, text="采样次数（1–120）", bg=COLORS["surface"], fg="#65746c", font=(FONT, 9, "bold")).pack(side="left")
+        tk.Label(row, text="采样次数（1–120）", bg=COLORS["surface"], fg="#6b7b92", font=(FONT, 9, "bold")).pack(side="left")
         self.gpu_history_samples_var = tk.StringVar(value="5")
         self.gpu_history_samples_entry = self._spinbox(row, textvariable=self.gpu_history_samples_var, from_=1, to=120, width=7)
         self.gpu_history_samples_entry.pack(side="left", padx=(12, 0))
         tk.Label(row, text="次 / 每张 GPU", bg=COLORS["surface"], fg="#8b9892", font=(FONT, 9)).pack(side="left", padx=8)
-        tk.Button(row, text="保存设置", command=self.save_global_settings, relief="flat", bd=0, bg=COLORS["green"], fg="#ffffff", font=(FONT, 9, "bold"), padx=13, pady=7).pack(side="right")
+        self._button(row, text="保存设置", command=self.save_global_settings, variant='primary').pack(side="right")
 
     def _show_view(self, view: str) -> None:
         self.current_view = view
@@ -1134,7 +1383,7 @@ class DesktopClient(tk.Tk):
             frame.pack_forget()
         self.views[view].pack(fill="both", expand=True)
         for name, button in self.nav_buttons.items():
-            button.configure(bg=COLORS["navy_soft"] if name == view else COLORS["navy"], fg="#f7fff9" if name == view else "#8da9a0")
+            button.configure(bg=COLORS["navy_soft"] if name == view else COLORS["navy"], fg="#f7fff9" if name == view else COLORS["nav_text"], font=(FONT, 11, "bold" if name == view else "normal"))
         labels = {
             "dashboard": ("LIVE RESOURCE MAP", "资源总览"),
             "queue": ("EXPERIMENT QUEUE", "实验队列"),
@@ -1144,6 +1393,13 @@ class DesktopClient(tk.Tk):
         }
         self.header_kicker.set(labels[view][0])
         self.header_title.set(labels[view][1])
+        self.header_description.set({
+            "dashboard": "跨服务器查看资源负载、显卡状态与队列动态。",
+            "queue": "按优先级、提交顺序与 GPU 基准速度自动调度。",
+            "benchmarks": "实测 Tensor FP16 与 FP32 吞吐，辅助 GPU 调度。",
+            "logs": "查看任务输出，自动同步最近 200 行日志。",
+            "settings": "统一设置所有服务器的 GPU 调度采样基准。",
+        }[view])
         if view == "dashboard":
             self.render_dashboard()
         elif view == "queue":
@@ -1171,11 +1427,11 @@ class DesktopClient(tk.Tk):
             self.render_settings()
             self.set_status(f"全局 GPU 采样基准已更新为最近 {count} 次")
         except Exception as exc:
-            messagebox.showerror("设置未保存", str(exc), parent=self)
+            self._message("error", "设置未保存", str(exc), parent=self)
 
     def set_status(self, message: str, error: bool = False) -> None:
         self.status_var.set(message)
-        self.status_bar.configure(fg=COLORS["red"] if error else "#6e8077")
+        self.status_bar.configure(fg=COLORS["red"] if error else "#6b7b92")
 
     def manual_refresh(self) -> None:
         self.set_status("正在刷新…")
@@ -1307,7 +1563,7 @@ class DesktopClient(tk.Tk):
             self.dashboard_server_panels = {}
             self.dashboard_server_signature = signature
             if not entries:
-                tk.Label(self.gpu_grid, text="还没有配置服务器，请在服务器管理中添加。", bg=COLORS["surface_soft"], fg="#99a7a1", font=(FONT, 10), padx=20, pady=28).pack(fill="x")
+                tk.Label(self.gpu_grid, text="还没有配置服务器，请在服务器管理中添加。", bg=COLORS["surface_soft"], fg="#7a8ba2", font=(FONT, 10), padx=20, pady=28).pack(fill="x")
             for row, (server, _state, _snapshot) in enumerate(entries):
                 server_id = str(server.get("id"))
                 panel = self._card(self.gpu_grid)
@@ -1317,15 +1573,15 @@ class DesktopClient(tk.Tk):
                 header.pack(fill="x", padx=17, pady=(15, 0))
                 name_label = tk.Label(header, text=server.get("name") or server.get("host") or server_id, bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 12, "bold"), anchor="w")
                 name_label.pack(side="left")
-                endpoint_label = tk.Label(header, text=f"{server.get('host', '')}:{server.get('port', 22)} · {server.get('username', '')}", bg=COLORS["surface"], fg="#8a9892", font=(MONO, 8))
-                endpoint_label.pack(side="left", padx=12)
+                endpoint_label = tk.Label(panel, text=f"{server.get('host', '')}:{server.get('port', 22)} · {server.get('username', '')}", bg=COLORS["surface"], fg=COLORS["muted"], font=(MONO, 8), anchor="w")
+                endpoint_label.pack(fill="x", padx=17, pady=(5, 0))
                 status_var = tk.StringVar(value="等待同步")
                 status_label = tk.Label(header, textvariable=status_var, bg=COLORS["surface"], fg=COLORS["green_dark"], font=(FONT, 8))
                 status_label.pack(side="right")
                 resources = tk.Frame(panel, bg=COLORS["surface"])
                 resources.pack(fill="x", padx=17, pady=(12, 0))
                 resource_vars: dict[str, tk.StringVar] = {}
-                resource_bars: dict[str, ttk.Progressbar] = {}
+                resource_bars: dict[str, ResourceBar] = {}
                 resource_defs = (("cpu", "CPU", "Green.Horizontal.TProgressbar"), ("ram", "内存", "Blue.Horizontal.TProgressbar"), ("gpu", "GPU 显存", "Purple.Horizontal.TProgressbar"), ("disk", "主目录", "Amber.Horizontal.TProgressbar"))
                 for index, (key, label, style) in enumerate(resource_defs):
                     card = tk.Frame(resources, bg=COLORS["surface_soft"])
@@ -1335,10 +1591,10 @@ class DesktopClient(tk.Tk):
                     detail_var = tk.StringVar(value="等待同步")
                     resource_vars[key] = value_var
                     resource_vars[key + "_detail"] = detail_var
-                    tk.Label(card, text=label, bg=COLORS["surface_soft"], fg="#84928b", font=(FONT, 8, "bold")).pack(anchor="w", padx=10, pady=(8, 0))
+                    tk.Label(card, text=label, bg=COLORS["surface_soft"], fg="#6b7b92", font=(FONT, 8, "bold")).pack(anchor="w", padx=10, pady=(8, 0))
                     tk.Label(card, textvariable=value_var, bg=COLORS["surface_soft"], fg=COLORS["ink"], font=(FONT, 15, "bold")).pack(anchor="w", padx=10, pady=(3, 0))
-                    tk.Label(card, textvariable=detail_var, bg=COLORS["surface_soft"], fg="#8a9892", font=(MONO, 7)).pack(anchor="w", padx=10, pady=(2, 4))
-                    bar = ttk.Progressbar(card, style=style, maximum=100, value=0)
+                    tk.Label(card, textvariable=detail_var, bg=COLORS["surface_soft"], fg="#6b7b92", font=(MONO, 7)).pack(anchor="w", padx=10, pady=(2, 4))
+                    bar = ResourceBar(card, style=style, maximum=100, value=0)
                     bar.pack(fill="x", padx=10, pady=(0, 8))
                     resource_bars[key] = bar
                 gpu_header = tk.Frame(panel, bg=COLORS["surface"])
@@ -1423,18 +1679,18 @@ class DesktopClient(tk.Tk):
         for child in frame.winfo_children():
             child.destroy()
 
-    def _meter(self, parent: tk.Misc, label: str, style: str, number_width: int = 7) -> tuple[ttk.Progressbar, tk.Label]:
+    def _meter(self, parent: tk.Misc, label: str, style: str, number_width: int = 7) -> tuple[ResourceBar, tk.Label]:
         row = tk.Frame(parent, bg=COLORS["surface"])
         row.pack(fill="x", pady=4)
-        tk.Label(row, text=label, bg=COLORS["surface"], fg="#85928c", font=(FONT, 8), width=6, anchor="w").pack(side="left")
-        bar = ttk.Progressbar(row, style=style, maximum=100, value=0)
+        tk.Label(row, text=label, bg=COLORS["surface"], fg="#6b7b92", font=(FONT, 8), width=6, anchor="w").pack(side="left")
+        bar = ResourceBar(row, style=style, maximum=100, value=0)
         bar.pack(side="left", fill="x", expand=True, padx=8)
         number_label = tk.Label(row, text="0.0%", bg=COLORS["surface"], fg="#52625b", font=(MONO, 8), width=number_width, anchor="e")
         number_label.pack(side="right")
         return bar, number_label
 
     def _bind_gpu_detail(self, widget: tk.Misc, server_id: str, gpu_index: int) -> None:
-        if widget.winfo_class() == "Button":
+        if widget.winfo_class() in ("Button", "TButton"):
             return
         widget.bind("<Button-1>", lambda _event, selected_server=server_id, selected_gpu=gpu_index: self.show_gpu_detail(selected_server, selected_gpu))
         for child in widget.winfo_children():
@@ -1448,6 +1704,7 @@ class DesktopClient(tk.Tk):
         gpu_ids = tuple(safe_int(gpu.get("index"), index) for index, gpu in enumerate(gpus))
         topology = (selected_server, *gpu_ids)
         if topology != state.get("topology"):
+            target_parent.unbind("<Configure>")
             self._clear(target_parent)
             state["widgets"] = {}
             state["topology"] = topology
@@ -1455,7 +1712,7 @@ class DesktopClient(tk.Tk):
                 self.gpu_widgets = state["widgets"]
                 self.gpu_topology = topology
             if not gpus:
-                tk.Label(target_parent, text="未检测到 NVIDIA GPU 或 nvidia-smi 不可用。", bg=COLORS["surface_soft"], fg="#99a7a1", font=(FONT, 10), padx=20, pady=28).pack(fill="x")
+                tk.Label(target_parent, text="未检测到 NVIDIA GPU 或 nvidia-smi 不可用。", bg=COLORS["surface_soft"], fg="#7a8ba2", font=(FONT, 10), padx=20, pady=28).pack(fill="x")
                 return
             columns = min(3, max(1, len(gpus)))
             for index, gpu in enumerate(gpus):
@@ -1468,19 +1725,23 @@ class DesktopClient(tk.Tk):
                 tk.Label(top, text=f"GPU {gpu_index}", bg=COLORS["mint"], fg=COLORS["green_dark"], font=(MONO, 9, "bold"), padx=8, pady=5).pack(side="left")
                 temp_label = tk.Label(top, bg=COLORS["surface"], font=(MONO, 8))
                 temp_label.pack(side="right")
-                name_label = tk.Label(card, bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 10, "bold"), anchor="w")
+                name_label = tk.Label(card, bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 10, "bold"), anchor="w", justify="left", width=1)
                 name_label.pack(fill="x", padx=17, pady=(10, 0))
-                uuid_label = tk.Label(card, bg=COLORS["surface"], fg="#99a49f", font=(MONO, 7), anchor="w")
+                card.bind("<Configure>", lambda event, label=name_label: label.configure(wraplength=max(1, event.width - 36)))
+                uuid_label = tk.Label(card, bg=COLORS["surface"], fg="#7a8ba2", font=(MONO, 7), anchor="w")
                 uuid_label.pack(fill="x", padx=17, pady=(3, 8))
                 memory_bar, memory_label = self._meter(card, "显存", "Purple.Horizontal.TProgressbar")
                 utilization_bar, utilization_label = self._meter(card, "利用率", "Green.Horizontal.TProgressbar")
                 foot = tk.Frame(card, bg=COLORS["surface"])
-                foot.pack(fill="x", padx=17, pady=(10, 14))
+                foot.pack(fill="x", padx=17, pady=(10, 4))
                 state_label = tk.Label(foot, bg=COLORS["surface"], font=(FONT, 8))
                 state_label.pack(side="left")
-                speed_label = tk.Label(foot, bg=COLORS["surface"], fg="#53615b", font=(MONO, 8))
-                speed_label.pack(side="left", padx=8)
-                tk.Button(foot, text="测试 ϟ", command=lambda selected_server=selected_server, selected=gpu_index: self.run_benchmark(selected_server, selected), bg=COLORS["surface"], fg=COLORS["green_dark"], relief="flat", bd=0, font=(FONT, 8, "bold")).pack(side="right")
+                tk.Label(foot, text="点击查看详情 →", bg=COLORS["surface"], fg=COLORS["muted"], font=(FONT, 8)).pack(side="right")
+                benchmark_row = tk.Frame(card, bg=COLORS["surface"])
+                benchmark_row.pack(fill="x", padx=17, pady=(0, 12))
+                speed_label = tk.Label(benchmark_row, bg=COLORS["surface"], fg=COLORS["muted"], font=(MONO, 9))
+                speed_label.pack(side="left")
+                self._button(benchmark_row, "测试 ϟ", lambda selected_server=selected_server, selected=gpu_index: self.run_benchmark(selected_server, selected), "soft").pack(side="right")
                 state["widgets"][gpu_index] = {
                     "card": card,
                     "temp": temp_label,
@@ -1495,6 +1756,10 @@ class DesktopClient(tk.Tk):
                 }
                 self._bind_gpu_detail(card, selected_server, gpu_index)
 
+            cards = [widget["card"] for widget in state["widgets"].values()]
+            target_parent.bind("<Configure>", lambda event: self._reflow_cards(target_parent, cards, event.width, 275, 3))
+            self._reflow_cards(target_parent, cards, target_parent.winfo_width(), 275, 3)
+
         for gpu in gpus:
             gpu_index = safe_int(gpu.get("index"), 0)
             widget = state["widgets"].get(gpu_index)
@@ -1505,7 +1770,7 @@ class DesktopClient(tk.Tk):
                 hot = float(temp) > 80
             except (TypeError, ValueError):
                 hot = False
-            widget["temp"].configure(text=f"{temp}°C", fg=COLORS["red"] if hot else "#8c9893")
+            widget["temp"].configure(text=f"{temp}°C", fg=COLORS["red"] if hot else "#6b7b92")
             widget["name"].configure(text=gpu.get("name", "Unknown GPU"))
             widget["uuid"].configure(text=str(gpu.get("uuid", ""))[:26])
             memory_percent = float(gpu.get("memory_used_mb") or 0) / max(float(gpu.get("memory_total_mb") or 1), 1) * 100
@@ -1522,30 +1787,31 @@ class DesktopClient(tk.Tk):
             widget["speed"].configure(text=speed)
 
     def show_gpu_detail(self, server_id: str, gpu_index: int) -> None:
-        dialog = tk.Toplevel(self)
-        dialog.title(f"GPU {gpu_index} 详情")
-        dialog.configure(bg=COLORS["bg"])
-        dialog.transient(self)
-        dialog.geometry("820x540")
-        dialog.minsize(700, 420)
         server = next((item for item in self.state.get("servers", []) if item.get("id") == server_id), {})
+        dialog, content, footer = self._dialog(f"GPU {gpu_index} 详情", "GPU INSPECTOR", f"{server.get('name') or server_id} · 实时资源与计算进程", size=(960, 680), card=False, modal=False)
+        self._button(footer, "关闭", dialog.destroy).pack(side="right")
         title_var = tk.StringVar(value=f"GPU {gpu_index}")
         subtitle_var = tk.StringVar(value=server.get("name") or server.get("host") or server_id)
         memory_var = tk.StringVar(value="显存：—")
         usage_var = tk.StringVar(value="利用率：—")
         temperature_var = tk.StringVar(value="温度：—")
         status_var = tk.StringVar(value="状态：—")
-        tk.Label(dialog, text="GPU DETAIL", bg=COLORS["bg"], fg="#84a49a", font=(MONO, 8)).pack(anchor="w", padx=22, pady=(20, 0))
-        header = tk.Frame(dialog, bg=COLORS["bg"])
-        header.pack(fill="x", padx=22, pady=(4, 13))
-        tk.Label(header, textvariable=title_var, bg=COLORS["bg"], fg=COLORS["ink"], font=(FONT, 20, "bold")).pack(side="left")
-        tk.Label(header, textvariable=subtitle_var, bg=COLORS["bg"], fg="#82918a", font=(FONT, 9)).pack(side="left", padx=14, pady=(6, 0))
-        summary = self._card(dialog)
-        summary.pack(fill="x", padx=22, pady=(0, 13))
-        for variable in (memory_var, usage_var, temperature_var, status_var):
-            tk.Label(summary, textvariable=variable, bg=COLORS["surface"], fg="#52625b", font=(FONT, 9), padx=14, pady=12).pack(side="left", fill="x", expand=True)
-        process_card = self._card(dialog)
-        process_card.pack(fill="both", expand=True, padx=22, pady=(0, 20))
+        tk.Label(content, textvariable=title_var, bg=COLORS["bg"], fg=COLORS["ink"], font=(FONT, 13, "bold"), anchor="w").pack(fill="x", pady=(0, 14))
+        summary = tk.Frame(content, bg=COLORS["bg"])
+        summary.pack(fill="x", pady=(0, 16))
+        summary.columnconfigure(0, weight=1, uniform="detail")
+        summary.columnconfigure(1, weight=1, uniform="detail")
+        detail_bars = []
+        for index, variable in enumerate((memory_var, usage_var, temperature_var, status_var)):
+            card = self._card(summary)
+            card.grid(row=index // 2, column=index % 2, sticky="nsew", padx=(0 if index % 2 == 0 else 12, 0), pady=(0, 10))
+            tk.Label(card, textvariable=variable, bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 10), anchor="w").pack(fill="x", padx=16, pady=(14, 10))
+            if index < 2:
+                bar = ResourceBar(card, "Purple.Horizontal.TProgressbar" if index == 0 else "Green.Horizontal.TProgressbar")
+                bar.pack(fill="x", padx=16, pady=(0, 14))
+                detail_bars.append(bar)
+        process_card = self._card(content)
+        process_card.pack(fill="both", expand=True)
         tk.Label(process_card, text="运行中的计算进程", bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 13, "bold")).pack(anchor="w", padx=16, pady=(14, 10))
         process_frame = tk.Frame(process_card, bg=COLORS["surface"])
         process_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -1556,10 +1822,14 @@ class DesktopClient(tk.Tk):
         for column in columns:
             process_tree.heading(column, text=headings[column])
             process_tree.column(column, width=widths[column], anchor="w")
-        process_tree.pack(side="left", fill="both", expand=True)
+        process_frame.rowconfigure(0, weight=1)
+        process_frame.columnconfigure(0, weight=1)
+        process_tree.grid(row=0, column=0, sticky="nsew")
         process_scroll = ttk.Scrollbar(process_frame, orient="vertical", command=process_tree.yview)
-        process_scroll.pack(side="right", fill="y")
-        process_tree.configure(yscrollcommand=process_scroll.set)
+        process_scroll.grid(row=0, column=1, sticky="ns")
+        process_horizontal = ttk.Scrollbar(process_frame, orient="horizontal", command=process_tree.xview)
+        process_horizontal.grid(row=1, column=0, sticky="ew")
+        process_tree.configure(yscrollcommand=process_scroll.set, xscrollcommand=process_horizontal.set)
 
         def update() -> None:
             if not dialog.winfo_exists():
@@ -1574,6 +1844,8 @@ class DesktopClient(tk.Tk):
                 usage_var.set("利用率：—")
                 temperature_var.set("温度：—")
                 status_var.set("状态：未连接")
+                for bar in detail_bars:
+                    bar["value"] = 0
             else:
                 total = safe_int(gpu.get("memory_total_mb"), 0)
                 used = safe_int(gpu.get("memory_used_mb"), 0)
@@ -1582,6 +1854,8 @@ class DesktopClient(tk.Tk):
                 title_var.set(f"GPU {gpu_index} · {gpu.get('name', 'Unknown GPU')}")
                 memory_var.set(f"显存：{percent:.1f}% · {free:,} MB 可用")
                 usage_var.set(f"利用率：{float(gpu.get('utilization_gpu') or 0):.1f}%")
+                detail_bars[0]["value"] = percent
+                detail_bars[1]["value"] = float(gpu.get("utilization_gpu") or 0)
                 temperature_var.set(f"温度：{gpu.get('temperature_c', '—')}°C")
                 idle = bool(gpu.get("scheduler_idle")) and not gpu.get("reserved_mb")
                 status_var.set("状态：空闲可调度" if idle else f"状态：{gpu.get('process_count', 0)} 个进程")
@@ -1605,7 +1879,7 @@ class DesktopClient(tk.Tk):
         self.activity_signature = signature
         self._clear(self.activity_body)
         if not items:
-            tk.Label(self.activity_body, text="还没有实验任务", bg=COLORS["surface"], fg="#99a7a1", font=(FONT, 10), pady=20).pack()
+            tk.Label(self.activity_body, text="还没有实验任务", bg=COLORS["surface"], fg="#7a8ba2", font=(FONT, 10), pady=20).pack()
             return
         server_names = {str(server.get("id")): server.get("name") or server.get("host") or server.get("id") for server in self.state.get("servers", [])}
         for item in items:
@@ -1618,7 +1892,7 @@ class DesktopClient(tk.Tk):
             text_frame = tk.Frame(row, bg=COLORS["surface"])
             text_frame.pack(side="left", fill="x", expand=True)
             tk.Label(text_frame, text=f"{task_identifier(item)}  {item.get('name', '')}", bg=COLORS["surface"], fg="#3c4c45", font=(FONT, 9, "bold"), anchor="w").pack(fill="x")
-            tk.Label(text_frame, text=detail, bg=COLORS["surface"], fg="#9aa59f", font=(FONT, 8), anchor="w").pack(fill="x", pady=(2, 0))
+            tk.Label(text_frame, text=detail, bg=COLORS["surface"], fg="#7a8ba2", font=(FONT, 8), anchor="w").pack(fill="x", pady=(2, 0))
             tk.Label(row, text=STATUS_LABELS.get(item.get("status"), item.get("status", "")), bg=COLORS["surface"], fg="#819089", font=(FONT, 8)).pack(side="right")
 
     def render_storage_collection(self, entries: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]]) -> None:
@@ -1629,7 +1903,7 @@ class DesktopClient(tk.Tk):
         self._clear(self.storage_body)
         self.storage_path_var.set(f"{len(entries)} 台服务器")
         if not entries:
-            tk.Label(self.storage_body, text="暂无服务器", bg=COLORS["surface"], fg="#99a7a1", font=(FONT, 10), pady=20).pack()
+            tk.Label(self.storage_body, text="暂无服务器", bg=COLORS["surface"], fg="#7a8ba2", font=(FONT, 10), pady=20).pack()
             return
         for server, _state, snapshot in entries:
             row = tk.Frame(self.storage_body, bg=COLORS["surface"])
@@ -1643,9 +1917,9 @@ class DesktopClient(tk.Tk):
             used_percent = float(disk.get("used_percent") or 0)
             detail = f"{used_percent:.1f}% 已使用 · {fmt_bytes(disk.get('free_bytes'))} 可用"
             tk.Label(row, text=detail, bg=COLORS["surface"], fg="#85938c", font=(MONO, 8), anchor="w").pack(fill="x", pady=(2, 3))
-            bar = ttk.Progressbar(row, style="Amber.Horizontal.TProgressbar", maximum=100, value=used_percent)
+            bar = ResourceBar(row, style="Amber.Horizontal.TProgressbar", maximum=100, value=used_percent)
             bar.pack(fill="x")
-        
+
 
     def render_storage(self, disk: dict[str, Any]) -> None:
         signature = (disk.get("path"), disk.get("total_bytes"), disk.get("used_bytes"), disk.get("free_bytes"), disk.get("used_percent"))
@@ -1704,7 +1978,7 @@ class DesktopClient(tk.Tk):
             self.scheduler_notice.configure(bg="#fff5e8", fg="#a56a18")
         else:
             self.scheduler_notice_var.set("调度正常 · 等待任务会按服务器分别调度")
-            self.scheduler_notice.configure(bg="#eff9f3", fg=COLORS["green_dark"])
+            self.scheduler_notice.configure(bg="#eaf7f3", fg=COLORS["green_dark"])
         if not hasattr(self, "queue_tree"):
             return
         visible = []
@@ -1750,7 +2024,7 @@ class DesktopClient(tk.Tk):
     def set_queue_filter(self, value: str) -> None:
         self.queue_filter = value
         for key, button in self.filter_buttons.items():
-            button.configure(bg=COLORS["mint"] if key == value else COLORS["surface"], fg=COLORS["green_dark"] if key == value else COLORS["muted"], font=(FONT, 9, "bold" if key == value else "normal"))
+            self._button_variant(button, "soft" if key == value else "secondary")
         self.render_queue()
 
     def _run_queue_action(self, action: Any, success_message: str) -> None:
@@ -1828,7 +2102,7 @@ class DesktopClient(tk.Tk):
             self._clear(self.benchmark_cards)
             self.benchmark_widgets = {}
             if not groups:
-                tk.Label(self.benchmark_cards, text="请先在服务器管理中添加服务器。", bg=COLORS["surface_soft"], fg="#99a7a1", font=(FONT, 10), padx=20, pady=28).pack(fill="x")
+                tk.Label(self.benchmark_cards, text="请先在服务器管理中添加服务器。", bg=COLORS["surface_soft"], fg="#7a8ba2", font=(FONT, 10), padx=20, pady=28).pack(fill="x")
             for server_id, server, _state, gpus, envs, default_env in groups:
                 section = tk.Frame(self.benchmark_cards, bg=COLORS["bg"])
                 section.pack(fill="x", pady=(0, 12))
@@ -1842,29 +2116,33 @@ class DesktopClient(tk.Tk):
                     server_status = f"已连接 · {len(gpus)} 张显卡"
                 else:
                     server_status = "未连接" if not gpus else f"未连接 · 显示上次资源快照（{len(gpus)} 张显卡）"
-                tk.Label(section_header, text=server_status, bg=COLORS["surface"], fg="#82918a", font=(MONO, 8)).pack(side="right", padx=14, pady=10)
+                tk.Label(section_header, text=server_status, bg=COLORS["surface"], fg="#6b7b92", font=(MONO, 8)).pack(side="right", padx=14, pady=10)
                 grid = tk.Frame(section, bg=COLORS["bg"])
                 grid.pack(fill="x")
                 if not gpus:
                     message = "监控已停用，启用后才能执行测试。" if not server.get("enabled", True) else "尚未连接或暂无 NVIDIA GPU。"
-                    tk.Label(grid, text=message, bg=COLORS["surface_soft"], fg="#99a7a1", font=(FONT, 10), padx=20, pady=22).pack(fill="x")
+                    tk.Label(grid, text=message, bg=COLORS["surface_soft"], fg="#7a8ba2", font=(FONT, 10), padx=20, pady=22).pack(fill="x")
                     continue
                 columns = min(3, max(1, len(gpus)))
+                cards: list[tk.Frame] = []
                 for index, gpu in enumerate(gpus):
                     gpu_index = safe_int(gpu.get("index"), index)
                     card = self._card(grid)
+                    cards.append(card)
                     card.grid(row=index // columns, column=index % columns, sticky="nsew", padx=(0 if index % columns == 0 else 6, 0), pady=(0, 8))
                     grid.columnconfigure(index % columns, weight=1)
                     top = tk.Frame(card, bg=COLORS["surface"])
                     top.pack(fill="x", padx=17, pady=(16, 0))
                     detail_command = lambda _event, selected_server=server_id, selected_gpu=gpu_index: self.show_gpu_detail(selected_server, selected_gpu)
                     top.bind("<Button-1>", detail_command)
-                    title_label = tk.Label(top, text=f"GPU {gpu_index} · {gpu.get('name')}", bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 10, "bold"), anchor="w")
-                    title_label.pack(side="left")
+                    tk.Label(top, text=f"GPU {gpu_index}", bg=COLORS["mint"], fg=COLORS["green_dark"], font=(MONO, 9, "bold"), padx=8, pady=5).pack(side="left")
+                    title_label = tk.Label(card, text=gpu.get("name"), bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 10, "bold"), anchor="w", justify="left", width=1)
+                    title_label.pack(fill="x", padx=17, pady=(10, 0))
+                    card.bind("<Configure>", lambda event, label=title_label: label.configure(wraplength=max(1, event.width - 36)))
                     title_label.bind("<Button-1>", detail_command)
-                    temp_label = tk.Label(top, text="—°C", bg=COLORS["surface"], fg="#8c9893", font=(MONO, 8))
+                    temp_label = tk.Label(top, text="—°C", bg=COLORS["surface"], fg="#6b7b92", font=(MONO, 8))
                     temp_label.pack(side="right")
-                    memory_label = tk.Label(card, text="显存 —", bg=COLORS["surface"], fg="#7e8d86", font=(MONO, 8), anchor="w")
+                    memory_label = tk.Label(card, text="显存 —", bg=COLORS["surface"], fg="#6b7b92", font=(MONO, 8), anchor="w")
                     memory_label.pack(fill="x", padx=17, pady=(8, 0))
                     score = tk.Frame(card, bg=COLORS["surface"])
                     score.pack(fill="x", padx=17, pady=(17, 10))
@@ -1873,7 +2151,7 @@ class DesktopClient(tk.Tk):
                         box = tk.Frame(score, bg=COLORS["surface_soft"])
                         box.grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 5, 0))
                         score.columnconfigure(column, weight=1)
-                        tk.Label(box, text=label, bg=COLORS["surface_soft"], fg="#899790", font=(FONT, 8)).pack(anchor="w", padx=10, pady=(9, 0))
+                        tk.Label(box, text=label, bg=COLORS["surface_soft"], fg="#6b7b92", font=(FONT, 8)).pack(anchor="w", padx=10, pady=(9, 0))
                         value_label = tk.Label(box, text="— TFLOPS", bg=COLORS["surface_soft"], fg=COLORS["ink"], font=(MONO, 13, "bold"))
                         value_label.pack(anchor="w", padx=10, pady=(5, 9))
                         score_labels[label] = value_label
@@ -1881,10 +2159,10 @@ class DesktopClient(tk.Tk):
                     actions.pack(fill="x", padx=17, pady=(4, 15))
                     env_value = default_env if default_env in envs else "默认 Python"
                     env_var = tk.StringVar(value=env_value)
-                    combo = ttk.Combobox(actions, textvariable=env_var, state="readonly", values=["默认 Python"] + envs, width=16)
-                    combo.pack(side="left")
-                    button = tk.Button(actions, text="运行测试 ϟ", command=lambda selected_server=server_id, selected_gpu=gpu_index, var=env_var: self.run_benchmark(selected_server, selected_gpu, "" if var.get() == "默认 Python" else var.get()), relief="flat", bd=0, bg="#f0fbf6", fg=COLORS["green_dark"], font=(FONT, 9, "bold"), padx=8, pady=5)
-                    button.pack(side="right")
+                    combo = self._combobox(actions, textvariable=env_var, state="readonly", values=["默认 Python"] + envs, width=16)
+                    combo.pack(fill="x", pady=(0, 8))
+                    button = self._button(actions, "运行测试 ϟ", lambda selected_server=server_id, selected_gpu=gpu_index, var=env_var: self.run_benchmark(selected_server, selected_gpu, "" if var.get() == "默认 Python" else var.get()), "soft")
+                    button.pack(fill="x")
                     self.benchmark_widgets[(server_id, gpu_index)] = {
                         "temp": temp_label,
                         "memory": memory_label,
@@ -1892,6 +2170,8 @@ class DesktopClient(tk.Tk):
                         "fp32": score_labels["FP32"],
                         "button": button,
                     }
+                grid.bind("<Configure>", lambda event, parent=grid, widgets=cards: self._reflow_cards(parent, widgets, event.width, 290, 3))
+                self._reflow_cards(grid, cards, grid.winfo_width(), 290, 3)
 
         for server_id, _server, _state, gpus, _envs, _default_env in groups:
             for gpu in gpus:
@@ -1904,7 +2184,7 @@ class DesktopClient(tk.Tk):
                     hot = float(temp) > 80
                 except (TypeError, ValueError):
                     hot = False
-                widget["temp"].configure(text=f"{temp}°C", fg=COLORS["red"] if hot else "#8c9893")
+                widget["temp"].configure(text=f"{temp}°C", fg=COLORS["red"] if hot else "#6b7b92")
                 total_memory = safe_int(gpu.get("memory_total_mb"), 0)
                 used_memory = safe_int(gpu.get("memory_used_mb"), 0)
                 memory_percent = used_memory / max(total_memory, 1) * 100
@@ -1938,7 +2218,7 @@ class DesktopClient(tk.Tk):
                 return
             self.log_signature = (None, ())
             self._clear(self.log_list_body)
-            tk.Label(self.log_list_body, text="暂无实验", bg=COLORS["surface"], fg="#99a7a1", font=(FONT, 10), pady=20).pack()
+            tk.Label(self.log_list_body, text="暂无实验", bg=COLORS["surface"], fg="#7a8ba2", font=(FONT, 10), pady=20).pack()
             return
         if not self.selected_log or not any(item.get("id") == self.selected_log for item in items):
             self.selected_log = items[0].get("id")
@@ -1949,7 +2229,7 @@ class DesktopClient(tk.Tk):
         self._clear(self.log_list_body)
         for item in items:
             selected = item.get("id") == self.selected_log
-            button = tk.Button(self.log_list_body, text=f"{task_identifier(item)}  {item.get('name')}\\n{item.get('script_name')} · {fmt_time(item.get('created_at'))}\\n{STATUS_LABELS.get(item.get('status'), item.get('status'))}", command=lambda exp_id=item.get("id"): self.select_log(exp_id), justify="left", anchor="w", relief="flat", bd=0, bg="#f1f8f4" if selected else COLORS["surface"], fg="#425149", font=(FONT, 9), padx=9, pady=8)
+            button = tk.Button(self.log_list_body, text=f"{task_identifier(item)}  {item.get('name')}\n{item.get('script_name')} · {fmt_time(item.get('created_at'))}\n{STATUS_LABELS.get(item.get('status'), item.get('status'))}", command=lambda exp_id=item.get("id"): self.select_log(exp_id), justify="left", anchor="w", relief="flat", bd=0, bg=COLORS["mint"] if selected else COLORS["surface"], fg=COLORS["green_dark"] if selected else COLORS["ink"], activebackground=COLORS["mint"], activeforeground=COLORS["green_dark"], font=(FONT, 9), padx=12, pady=12, wraplength=max(180, self.log_list_canvas.winfo_width() - 26), cursor="hand2")
             button.pack(fill="x", pady=2)
         self.load_selected_log()
 
@@ -2006,22 +2286,15 @@ class DesktopClient(tk.Tk):
             return
         target_runtime = self.manager.runtime_for(str(item.get("server_id") or "default"))
         if not target_runtime.connected:
-            messagebox.showinfo("完整日志", "请先连接该实验所在的服务器。", parent=self)
+            self._message("info", "完整日志", "请先连接该实验所在的服务器。", parent=self)
             return
-        dialog = tk.Toplevel(self)
-        dialog.title(f"完整日志 · {item.get('name') or task_identifier(item)}")
-        dialog.configure(bg=COLORS["bg"])
-        dialog.transient(self)
-        dialog.geometry("1000x720")
-        dialog.minsize(700, 450)
-        header = tk.Frame(dialog, bg=COLORS["bg"])
-        header.pack(fill="x", padx=18, pady=(16, 8))
-        tk.Label(header, text=f"完整日志 · {task_identifier(item)} {item.get('name') or ''}", bg=COLORS["bg"], fg=COLORS["ink"], font=(FONT, 13, "bold")).pack(side="left")
+        dialog, content, footer = self._dialog("完整运行日志", "FULL RUN LOG", f"{task_identifier(item)} · {item.get('name') or ''}", size=(1000, 760), card=False, modal=False)
+        self._button(footer, "关闭", dialog.destroy).pack(side="right")
         status_var = tk.StringVar(value="正在读取服务器上的完整日志…")
-        tk.Label(dialog, textvariable=status_var, bg=COLORS["bg"], fg=COLORS["muted"], font=(FONT, 8), anchor="w").pack(fill="x", padx=19, pady=(0, 7))
-        body = tk.Frame(dialog, bg="#122c27")
-        body.pack(fill="both", expand=True, padx=18, pady=(0, 16))
-        text_widget = tk.Text(body, bg="#122c27", fg="#a6c8b7", insertbackground="#a6c8b7", relief="flat", bd=0, wrap="none", font=(MONO, 9), padx=14, pady=12)
+        tk.Label(content, textvariable=status_var, bg=COLORS["bg"], fg=COLORS["muted"], font=(FONT, 9), anchor="w").pack(fill="x", pady=(0, 10))
+        body = tk.Frame(content, bg=COLORS["terminal"])
+        body.pack(fill="both", expand=True)
+        text_widget = tk.Text(body, bg="#152238", fg="#c4d5e9", insertbackground="#c4d5e9", relief="flat", bd=0, wrap="none", font=(MONO, 9), padx=14, pady=12)
         scrollbar = ttk.Scrollbar(body, orient="vertical", command=text_widget.yview)
         horizontal = ttk.Scrollbar(body, orient="horizontal", command=text_widget.xview)
         text_widget.configure(yscrollcommand=scrollbar.set, xscrollcommand=horizontal.set, state="disabled")
@@ -2065,18 +2338,8 @@ class DesktopClient(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def open_server_manager(self) -> None:
-        dialog = tk.Toplevel(self)
-        dialog.title("服务器管理")
-        dialog.configure(bg=COLORS["bg"])
-        dialog.transient(self)
-        dialog.grab_set()
-        dialog.geometry("760x560")
-        dialog.minsize(700, 500)
-
-        tk.Label(dialog, text="SERVER MANAGEMENT", bg=COLORS["bg"], fg="#84a49a", font=(MONO, 8)).pack(anchor="w", padx=22, pady=(20, 0))
-        tk.Label(dialog, text="服务器管理", bg=COLORS["bg"], fg=COLORS["ink"], font=(FONT, 20, "bold")).pack(anchor="w", padx=22, pady=(4, 0))
-        tk.Label(dialog, text="每条记录对应一个独立 SSH 连接；相同 IP 但不同端口、账号或连接用途可以分别保存。", bg=COLORS["bg"], fg="#87958e", font=(FONT, 9)).pack(anchor="w", padx=22, pady=(4, 14))
-        table_frame = tk.Frame(dialog, bg=COLORS["surface"], highlightbackground=COLORS["line"], highlightthickness=1)
+        dialog, content, footer = self._dialog("服务器管理", "SERVER MANAGEMENT", "每条记录对应一个独立 SSH 连接；相同 IP 的不同端口、账号或用途可以分别保存。", size=(900, 640), card=False)
+        table_frame = self._card(content)
         table_frame.pack(fill="both", expand=True, padx=22, pady=(0, 13))
         columns = ("name", "host", "status", "disk", "monitor", "auto")
         tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse", height=6)
@@ -2116,12 +2379,11 @@ class DesktopClient(tk.Tk):
 
         tree.bind("<<TreeviewSelect>>", select_server)
         tree.bind("<Double-1>", lambda _event: self.open_connection_dialog(selected_id(), parent=dialog, on_saved=refresh) if selected_id() else None)
-        tk.Label(dialog, text="先单击选中一台服务器，再使用下方按钮；新增连接不会覆盖已有服务器记录。", bg=COLORS["bg"], fg="#7d8d85", font=(FONT, 9)).pack(anchor="w", padx=22, pady=(0, 8))
-        buttons = tk.Frame(dialog, bg=COLORS["bg"])
-        buttons.pack(fill="x", padx=22, pady=(0, 18))
-        tk.Button(buttons, text="新建服务器", command=lambda: self.open_connection_dialog(new_server=True, parent=dialog, on_saved=refresh), relief="flat", bd=0, bg=COLORS["green"], fg="#ffffff", font=(FONT, 9, "bold"), padx=12, pady=7).pack(side="left")
-        tk.Button(buttons, text="编辑", command=lambda: (self.open_connection_dialog(selected_id(), parent=dialog, on_saved=refresh) if selected_id() else self.set_status("请先选择服务器", True)), relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["green_dark"], font=(FONT, 9), padx=12, pady=7).pack(side="left", padx=7)
-        tk.Button(buttons, text="磁盘告警", command=lambda: (self.open_disk_alert_dialog(selected_id(), parent=dialog, on_saved=refresh) if selected_id() else self.set_status("请先选择服务器", True)), relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["green_dark"], font=(FONT, 9), padx=12, pady=7).pack(side="left")
+        tk.Label(content, text="先单击选中一台服务器，再使用下方按钮；新增连接不会覆盖已有服务器记录。", bg=COLORS["bg"], fg="#6b7b92", font=(FONT, 9)).pack(anchor="w", padx=22, pady=(0, 8))
+        buttons = footer
+        self._button(buttons, text="新建服务器", command=lambda: self.open_connection_dialog(new_server=True, parent=dialog, on_saved=refresh), variant='primary').pack(side="left")
+        self._button(buttons, text="编辑", command=lambda: (self.open_connection_dialog(selected_id(), parent=dialog, on_saved=refresh) if selected_id() else self.set_status("请先选择服务器", True)), variant='secondary').pack(side="left", padx=7)
+        self._button(buttons, text="磁盘告警", command=lambda: (self.open_disk_alert_dialog(selected_id(), parent=dialog, on_saved=refresh) if selected_id() else self.set_status("请先选择服务器", True)), variant='secondary').pack(side="left")
 
         def toggle_monitoring() -> None:
             server_id = selected_id()
@@ -2137,24 +2399,24 @@ class DesktopClient(tk.Tk):
             refresh()
             self.set_status(f"已{'启用' if enabled else '停用'} {item.get('name') or server_id} 的资源监控")
 
-        tk.Button(buttons, text="启用/停用监控", command=toggle_monitoring, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["amber"], font=(FONT, 9), padx=12, pady=7).pack(side="left")
+        self._button(buttons, text="启用/停用监控", command=toggle_monitoring, variant='secondary').pack(side="left")
 
         def remove() -> None:
             server_id = selected_id()
             if not server_id:
                 self.set_status("请先选择服务器", True)
                 return
-            if not messagebox.askyesno("删除服务器", "只删除本机保存的连接配置，不会删除服务器上的文件。继续吗？", parent=dialog):
+            if not self._message("question", "删除服务器", "只删除本机保存的连接配置，不会删除服务器上的文件。继续吗？", parent=dialog):
                 return
             try:
                 self.manager.remove_server(server_id)
                 self.refresh_state()
                 refresh()
             except Exception as exc:
-                messagebox.showerror("无法删除", str(exc), parent=dialog)
+                self._message("error", "无法删除", str(exc), parent=dialog)
 
-        tk.Button(buttons, text="删除", command=remove, relief="flat", bd=0, bg="#fff1ef", fg=COLORS["red"], font=(FONT, 9), padx=12, pady=7).pack(side="left")
-        tk.Button(buttons, text="关闭", command=dialog.destroy, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["muted"], font=(FONT, 9), padx=12, pady=7).pack(side="right")
+        self._button(buttons, text="删除", command=remove, variant='danger').pack(side="left")
+        self._button(buttons, text="关闭", command=dialog.destroy, variant='secondary').pack(side="right")
         refresh()
 
     def open_disk_alert_dialog(self, server_id: str, parent: tk.Misc | None = None, on_saved: Any = None) -> None:
@@ -2162,23 +2424,16 @@ class DesktopClient(tk.Tk):
         if record is None:
             self.set_status("服务器不存在", True)
             return
-        dialog = tk.Toplevel(parent or self)
-        dialog.title("磁盘告警容量")
-        dialog.configure(bg=COLORS["surface"])
-        dialog.transient(parent or self)
-        dialog.grab_set()
-        dialog.resizable(False, False)
         name = record.get("name") or record.get("profile", {}).get("host") or server_id
-        tk.Label(dialog, text="SERVER DISK ALERT", bg=COLORS["surface"], fg="#84a49a", font=(MONO, 8)).grid(row=0, column=0, columnspan=2, sticky="w", padx=24, pady=(20, 0))
-        tk.Label(dialog, text=f"{name} · 磁盘告警", bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 18, "bold")).grid(row=1, column=0, columnspan=2, sticky="w", padx=24, pady=(5, 4))
-        tk.Label(dialog, text="主目录可用空间低于此值时报警并暂停该服务器的任务调度。设为 0 可关闭磁盘告警。", bg=COLORS["surface"], fg="#7d8d85", font=(FONT, 9), wraplength=410, justify="left").grid(row=2, column=0, columnspan=2, sticky="w", padx=24, pady=(0, 16))
-        tk.Label(dialog, text="告警容量（GB）", bg=COLORS["surface"], fg="#65746c", font=(FONT, 9, "bold")).grid(row=3, column=0, sticky="w", padx=24, pady=(0, 8))
+        dialog, content, footer = self._dialog(f"{name} · 磁盘告警", "DISK GUARD", "主目录可用空间低于此值时报警并暂停调度；设为 0 可关闭告警。", parent=parent, size=(640, 380))
+        content.columnconfigure(1, weight=1)
+        tk.Label(content, text="告警容量（GB）", bg=COLORS["surface"], fg="#6b7b92", font=(FONT, 9, "bold")).grid(row=3, column=0, sticky="w", padx=24, pady=(0, 8))
         value = tk.StringVar(value=f"{safe_float(record.get('disk_alert_gb'), 5):g}")
-        entry = self._spinbox(dialog, textvariable=value, from_=0, to=1000000, increment=0.5, width=18)
+        entry = self._spinbox(content, textvariable=value, from_=0, to=1000000, increment=0.5, width=18)
         entry.grid(row=3, column=1, sticky="ew", padx=(10, 24), pady=(0, 8))
-        buttons = tk.Frame(dialog, bg=COLORS["surface"])
-        buttons.grid(row=4, column=0, columnspan=2, sticky="e", padx=24, pady=(10, 18))
-        tk.Button(buttons, text="取消", command=dialog.destroy, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["muted"], font=(FONT, 9), padx=10, pady=7).pack(side="left", padx=5)
+        buttons = tk.Frame(footer, bg=COLORS["surface"])
+        buttons.pack(side="right")
+        self._button(buttons, text="取消", command=dialog.destroy, variant='secondary').pack(side="left", padx=(0, 8))
 
         def save() -> None:
             raw = value.get().strip()
@@ -2193,11 +2448,11 @@ class DesktopClient(tk.Tk):
                 dialog.destroy()
                 self.set_status(f"{name} 磁盘告警容量已设为 {threshold:g} GB" if threshold else f"{name} 磁盘告警已关闭")
             except ValueError:
-                messagebox.showwarning("容量无效", "请输入 0 到 1,000,000 之间的 GB 数值。", parent=dialog)
+                self._message("warning", "容量无效", "请输入 0 到 1,000,000 之间的 GB 数值。", parent=dialog)
             except Exception as exc:
-                messagebox.showerror("设置未保存", str(exc), parent=dialog)
+                self._message("error", "设置未保存", str(exc), parent=dialog)
 
-        tk.Button(buttons, text="保存设置  →", command=save, relief="flat", bd=0, bg=COLORS["green"], fg="#ffffff", font=(FONT, 9, "bold"), padx=13, pady=7).pack(side="left", padx=5)
+        self._button(buttons, text="保存设置  →", command=save, variant='primary').pack(side="left", padx=(0, 8))
 
     def open_connection_dialog(self, server_id: str | None = None, parent: tk.Misc | None = None, on_saved: Any = None, new_server: bool = False) -> None:
         target_parent = parent or self
@@ -2207,41 +2462,34 @@ class DesktopClient(tk.Tk):
         profile = dict((record or {}).get("profile") or {})
         if not profile and server_id == self.manager.active_server_id:
             profile = dict(self.state.get("profile") or {})
-        dialog = tk.Toplevel(target_parent)
-        dialog.title("新增服务器" if new_server else "连接设置")
-        dialog.configure(bg=COLORS["surface"])
-        dialog.transient(target_parent)
-        dialog.grab_set()
-        dialog.resizable(False, False)
+        dialog, content, footer = self._dialog("新增服务器" if new_server else "连接设置", "SSH CONNECTION", "连接后在用户主目录创建 ~/.gpu-orchestrator，无需 root 权限。", parent=target_parent, size=(760, 760), scroll=True)
+        content.columnconfigure(1, weight=1)
         name_var = tk.StringVar(value=(record or {}).get("name") or profile.get("host", ""))
-        tk.Label(dialog, text="SSH CONNECTION", bg=COLORS["surface"], fg="#84a49a", font=(MONO, 8)).grid(row=0, column=0, columnspan=2, sticky="w", padx=25, pady=(22, 0))
-        tk.Label(dialog, text="新增服务器" if new_server else "连接 Linux 服务器", bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 19, "bold")).grid(row=1, column=0, columnspan=2, sticky="w", padx=25, pady=(5, 4))
-        tk.Label(dialog, text="连接后会在你的主目录创建 ~/.gpu-orchestrator，不需要 root 权限。", bg=COLORS["surface"], fg="#7d8d85", font=(FONT, 9)).grid(row=2, column=0, columnspan=2, sticky="w", padx=25, pady=(0, 18))
-        entries: dict[str, tk.Entry] = {}
+        entries: dict[str, ttk.Entry] = {}
         fields = (("name", "显示名称", name_var.get()), ("host", "服务器 IP / 域名", profile.get("host", "")), ("port", "SSH 端口", str(profile.get("port", 22))), ("username", "用户名", profile.get("username", "")), ("password", "密码（留空使用已保存密码）", ""))
         for row, (key, label, value) in enumerate(fields, 3):
-            tk.Label(dialog, text=label, bg=COLORS["surface"], fg="#65746c", font=(FONT, 9, "bold")).grid(row=row, column=0, sticky="w", padx=25, pady=(0, 5))
-            entry = self._entry(dialog, width=35, show="*" if key == "password" else "")
+            tk.Label(content, text=label, bg=COLORS["surface"], fg="#6b7b92", font=(FONT, 9, "bold")).grid(row=row, column=0, sticky="w", padx=25, pady=(0, 5))
+            entry = self._entry(content, width=35, show="*" if key == "password" else "")
             entry.insert(0, value)
-            entry.grid(row=row, column=1, padx=(10, 25), pady=(0, 10))
+            entry.grid(row=row, column=1, sticky="ew", padx=(10, 25), pady=(0, 10))
             entries[key] = entry
-        tk.Label(dialog, text="轮询间隔（秒）", bg=COLORS["surface"], fg="#65746c", font=(FONT, 9, "bold")).grid(row=8, column=0, sticky="w", padx=25, pady=(0, 5))
-        interval = self._spinbox(dialog, from_=2, to=60, width=33)
+        tk.Label(content, text="轮询间隔（秒）", bg=COLORS["surface"], fg="#6b7b92", font=(FONT, 9, "bold")).grid(row=8, column=0, sticky="w", padx=25, pady=(0, 5))
+        interval = self._spinbox(content, from_=2, to=60, width=33)
         interval.delete(0, "end")
         interval.insert(0, str(profile.get("poll_interval", 5)))
-        interval.grid(row=8, column=1, padx=(10, 25), pady=(0, 10))
+        interval.grid(row=8, column=1, sticky="ew", padx=(10, 25), pady=(0, 10))
         save_var = tk.BooleanVar(value=True)
         auto_var = tk.BooleanVar(value=bool((record or {}).get("auto_connect", True)))
-        self._checkbutton(dialog, text="保存密码到本机系统密钥环（下次自动连接需要）", variable=save_var).grid(row=9, column=0, columnspan=2, sticky="w", padx=25, pady=(0, 5))
-        self._checkbutton(dialog, text="应用启动时自动连接此服务器", variable=auto_var).grid(row=10, column=0, columnspan=2, sticky="w", padx=25, pady=(0, 12))
-        tk.Label(dialog, text="首次连接会自动接受 SSH 主机指纹；正式环境建议改为 known_hosts 校验。", bg="#fff9ed", fg="#9a7c43", font=(FONT, 8), padx=10, pady=8).grid(row=11, column=0, columnspan=2, sticky="ew", padx=25)
-        buttons = tk.Frame(dialog, bg=COLORS["surface"])
-        buttons.grid(row=12, column=0, columnspan=2, sticky="e", padx=25, pady=20)
-        tk.Button(buttons, text="取消", command=dialog.destroy, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["muted"], font=(FONT, 9), padx=10, pady=7).pack(side="left", padx=5)
+        self._checkbutton(content, text="保存密码到本机系统密钥环（下次自动连接需要）", variable=save_var).grid(row=9, column=0, columnspan=2, sticky="w", padx=25, pady=(0, 5))
+        self._checkbutton(content, text="应用启动时自动连接此服务器", variable=auto_var).grid(row=10, column=0, columnspan=2, sticky="w", padx=25, pady=(0, 12))
+        tk.Label(content, text="首次连接会自动接受 SSH 主机指纹；正式环境建议改为 known_hosts 校验。", bg="#fff9ed", fg="#9a7c43", font=(FONT, 8), padx=10, pady=8).grid(row=11, column=0, columnspan=2, sticky="ew", padx=25)
+        buttons = tk.Frame(footer, bg=COLORS["surface"])
+        buttons.pack(side="right")
+        self._button(buttons, text="取消", command=dialog.destroy, variant='secondary').pack(side="left", padx=(0, 8))
         if server_id and self.manager.runtime_for(server_id).connected:
-            tk.Button(buttons, text="断开连接", command=lambda: self.disconnect(dialog, server_id), relief="flat", bd=0, bg="#fff1ef", fg=COLORS["red"], font=(FONT, 9), padx=10, pady=7).pack(side="left", padx=5)
-        connect_button = tk.Button(buttons, text="开始连接  →", relief="flat", bd=0, bg=COLORS["green"], fg="#ffffff", font=(FONT, 9, "bold"), padx=13, pady=7)
-        connect_button.pack(side="left", padx=5)
+            self._button(buttons, text="断开连接", command=lambda: self.disconnect(dialog, server_id), variant='danger').pack(side="left", padx=(0, 8))
+        connect_button = self._button(buttons, text="开始连接  →", variant='primary')
+        connect_button.pack(side="left", padx=(0, 8))
 
         def connect() -> None:
             profile_data = {
@@ -2271,7 +2519,7 @@ class DesktopClient(tk.Tk):
                     def failed() -> None:
                         if dialog.winfo_exists():
                             connect_button.configure(state="normal", text="开始连接  →")
-                            messagebox.showerror("连接失败", str(exc), parent=dialog)
+                            self._message("error", "连接失败", str(exc), parent=dialog)
                         self.set_status(str(exc), True)
                     self.after(0, failed)
 
@@ -2297,17 +2545,19 @@ class DesktopClient(tk.Tk):
             if experiment.get("status") == "running" or experiment.get("paused_process"):
                 self.set_status("执行中的任务请先暂停或停止后再编辑", True)
                 return
-        dialog = tk.Toplevel(self)
-        dialog.title("编辑实验任务" if editing else "提交一个实验")
-        dialog.configure(bg=COLORS["surface"])
-        dialog.transient(self)
-        dialog.grab_set()
-        dialog.resizable(False, False)
+        dialog, content, footer = self._dialog("编辑实验任务" if editing else "提交实验", "EXPERIMENT CONFIGURATION", "选择运行目标与脚本，配置调度策略；保存后进入等待队列。", size=(1020, 860), scroll=True, card=False)
+        content.columnconfigure(0, weight=1, uniform="form")
+        content.columnconfigure(1, weight=1, uniform="form")
+        basic = self._card(content)
+        basic.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        scheduling = self._card(content)
+        scheduling.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+        content.bind("<Configure>", lambda event: self._reflow_cards(content, [basic, scheduling], event.width, 420, 2), add="+")
+        for section, title in ((basic, "基本信息与前序任务"), (scheduling, "调度策略")):
+            section.columnconfigure(0, weight=1)
+            tk.Label(section, text=title, bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 12, "bold")).grid(row=0, column=0, sticky="w", padx=18, pady=(18, 6))
         prefs = self.state.get("preferences") or {}
         profile = self.state.get("profile") or {}
-        tk.Label(dialog, text="EDIT EXPERIMENT" if editing else "NEW EXPERIMENT", bg=COLORS["surface"], fg="#84a49a", font=(MONO, 8)).grid(row=0, column=0, columnspan=2, sticky="w", padx=25, pady=(22, 0))
-        tk.Label(dialog, text="编辑实验任务" if editing else "提交一个实验", bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 19, "bold")).grid(row=1, column=0, columnspan=2, sticky="w", padx=25, pady=(5, 4))
-        tk.Label(dialog, text="修改配置后重新进入等待队列；运行中的任务需要先暂停或停止。" if editing else "选择脚本、工作目录和运行环境；相同配置会成为下次默认值。", bg=COLORS["surface"], fg="#7d8d85", font=(FONT, 9)).grid(row=2, column=0, columnspan=2, sticky="w", padx=25, pady=(0, 18))
         initial_script = str((experiment or {}).get("local_script") or "")
         path_var = tk.StringVar(value=initial_script)
         name_var = tk.StringVar(value=str((experiment or {}).get("name") or ""))
@@ -2333,29 +2583,31 @@ class DesktopClient(tk.Tk):
         server_var = tk.StringVar(value=server_options[server_ids.index(selected_server_id)] if selected_server_id in server_ids else (server_options[0] if server_options else ""))
 
         def row_label(row: int, text: str) -> None:
-            tk.Label(dialog, text=text, bg=COLORS["surface"], fg="#65746c", font=(FONT, 9, "bold")).grid(row=row, column=0, sticky="w", padx=25, pady=(0, 5))
+            section = scheduling if row >= 10 else basic
+            local_row = (row - (10 if row >= 10 else 3)) * 2 + 1
+            tk.Label(section, text=text, bg=COLORS["surface"], fg=COLORS["muted"], font=(FONT, 9, "bold")).grid(row=local_row, column=0, sticky="w", padx=18, pady=(12, 6))
 
         row_label(3, "实验名称")
-        self._entry(dialog, textvariable=name_var, width=35).grid(row=3, column=1, padx=(10, 25), pady=(0, 10))
+        self._entry(basic, textvariable=name_var, width=35).grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 6))
         row_label(4, "目标服务器")
-        server_combo = ttk.Combobox(dialog, textvariable=server_var, state="disabled" if editing else "readonly", values=server_options, width=32)
-        server_combo.grid(row=4, column=1, padx=(10, 25), pady=(0, 10))
+        server_combo = self._combobox(basic, textvariable=server_var, state="disabled" if editing else "readonly", values=server_options, width=32)
+        server_combo.grid(row=4, column=0, sticky="ew", padx=18, pady=(0, 6))
         row_label(5, "选择 .sh 文件")
-        file_frame = tk.Frame(dialog, bg=COLORS["surface"])
-        file_frame.grid(row=5, column=1, sticky="ew", padx=(10, 25), pady=(0, 10))
-        tk.Button(file_frame, text="选择文件…", command=lambda: self.choose_script(path_var, path_label), relief="flat", bd=0, bg=COLORS["mint"], fg=COLORS["green_dark"], font=(FONT, 9, "bold"), padx=8, pady=5).pack(side="left")
+        file_frame = tk.Frame(basic, bg=COLORS["surface"])
+        file_frame.grid(row=6, column=0, sticky="ew", padx=18, pady=(0, 6))
+        self._button(file_frame, text="选择文件…", command=lambda: self.choose_script(path_var, path_label), variant='soft').pack(side="left")
         initial_script_label = Path(initial_script).name if initial_script else "尚未选择"
-        path_label = tk.Label(file_frame, text=initial_script_label, bg=COLORS["surface"], fg="#8d9993", font=(FONT, 8), width=25, anchor="w")
+        path_label = tk.Label(file_frame, text=initial_script_label, bg=COLORS["surface"], fg="#6b7b92", font=(FONT, 8), width=25, anchor="w")
         path_label.pack(side="left", padx=8)
         row_label(6, "服务器工作目录")
-        self._entry(dialog, textvariable=workdir_var, width=35).grid(row=6, column=1, padx=(10, 25), pady=(0, 10))
+        self._entry(basic, textvariable=workdir_var, width=35).grid(row=8, column=0, sticky="ew", padx=18, pady=(0, 6))
         row_label(7, "Conda 环境")
-        env_combo = ttk.Combobox(dialog, textvariable=env_var, state="readonly", values=["默认 Python"] + envs, width=32)
-        env_combo.grid(row=7, column=1, padx=(10, 25), pady=(0, 10))
+        env_combo = self._combobox(basic, textvariable=env_var, state="readonly", values=["默认 Python"] + envs, width=32)
+        env_combo.grid(row=10, column=0, sticky="ew", padx=18, pady=(0, 6))
 
         row_label(8, "前序任务（可多选）")
-        dependency_frame = tk.Frame(dialog, bg=COLORS["surface"])
-        dependency_frame.grid(row=8, column=1, sticky="ew", padx=(10, 25), pady=(0, 3))
+        dependency_frame = tk.Frame(basic, bg=COLORS["surface"])
+        dependency_frame.grid(row=12, column=0, sticky="ew", padx=18, pady=(0, 6))
         dependency_list = tk.Listbox(
             dependency_frame,
             height=4,
@@ -2371,12 +2623,17 @@ class DesktopClient(tk.Tk):
             highlightthickness=1,
             highlightbackground=COLORS["line"],
             highlightcolor=COLORS["green"],
-            font=(FONT, 9),
+            font=(FONT, 10),
+            activestyle="none",
+            selectborderwidth=0,
         )
-        dependency_list.pack(side="left", fill="both", expand=True)
+        dependency_frame.columnconfigure(0, weight=1)
+        dependency_list.grid(row=0, column=0, sticky="nsew")
         dependency_scroll = ttk.Scrollbar(dependency_frame, orient="vertical", command=dependency_list.yview)
-        dependency_scroll.pack(side="right", fill="y")
-        dependency_list.configure(yscrollcommand=dependency_scroll.set)
+        dependency_scroll.grid(row=0, column=1, sticky="ns")
+        dependency_horizontal = ttk.Scrollbar(dependency_frame, orient="horizontal", command=dependency_list.xview)
+        dependency_horizontal.grid(row=1, column=0, sticky="ew")
+        dependency_list.configure(yscrollcommand=dependency_scroll.set, xscrollcommand=dependency_horizontal.set)
         dependency_ids_by_index: list[str] = []
         dependency_selection = set(initial_dependencies)
         server_names = {
@@ -2410,8 +2667,8 @@ class DesktopClient(tk.Tk):
             else:
                 dependency_hint.configure(text="暂无可选任务，默认无前序任务。")
 
-        dependency_hint = tk.Label(dialog, text="", bg=COLORS["surface"], fg="#9aa7a0", font=(FONT, 8))
-        dependency_hint.grid(row=9, column=1, sticky="w", padx=(10, 25), pady=(0, 8))
+        dependency_hint = tk.Label(basic, text="", bg=COLORS["surface"], fg="#7a8ba2", font=(FONT, 8))
+        dependency_hint.grid(row=13, column=0, sticky="ew", padx=18, pady=(0, 6))
         def remember_dependencies(_event: Any = None) -> None:
             dependency_selection.clear()
             dependency_selection.update(
@@ -2448,23 +2705,23 @@ class DesktopClient(tk.Tk):
         if env_var.get() not in envs and env_var.get() != "默认 Python":
             env_var.set("默认 Python")
         row_label(10, "优先级（越小越先）")
-        self._spinbox(dialog, textvariable=priority_var, from_=1, to=999, width=33).grid(row=10, column=1, padx=(10, 25), pady=(0, 10))
+        self._spinbox(scheduling, textvariable=priority_var, from_=1, to=999, width=33).grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 6))
         row_label(11, "执行级别")
-        level_combo = ttk.Combobox(dialog, textvariable=level_var, state="readonly", values=tuple(EXECUTION_LEVEL_LABELS.values()), width=32)
-        level_combo.grid(row=11, column=1, padx=(10, 25), pady=(0, 10))
+        level_combo = self._combobox(scheduling, textvariable=level_var, state="readonly", values=tuple(EXECUTION_LEVEL_LABELS.values()), width=32)
+        level_combo.grid(row=4, column=0, sticky="ew", padx=18, pady=(0, 6))
         row_label(12, "忙卡利用率上限（%）")
-        max_util_entry = self._spinbox(dialog, textvariable=max_util_var, from_=0, to=100, width=33)
-        max_util_entry.grid(row=12, column=1, padx=(10, 25), pady=(0, 3))
-        tk.Label(dialog, text="低干扰执行时，最近采样的最高 GPU 利用率需低于此值。", bg=COLORS["surface"], fg="#9aa7a0", font=(FONT, 8)).grid(row=13, column=1, sticky="w", padx=(10, 25), pady=(0, 8))
+        max_util_entry = self._spinbox(scheduling, textvariable=max_util_var, from_=0, to=100, width=33)
+        max_util_entry.grid(row=6, column=0, sticky="ew", padx=18, pady=(0, 6))
+        tk.Label(scheduling, text="低干扰执行时，最近采样的最高 GPU 利用率需低于此值。", bg=COLORS["surface"], fg="#7a8ba2", font=(FONT, 8), wraplength=340, justify="left", anchor="w").grid(row=7, column=0, sticky="ew", padx=18, pady=(0, 6))
         row_label(14, "峰值显存（MB）")
-        self._entry(dialog, textvariable=memory_var, width=35).grid(row=14, column=1, padx=(10, 25), pady=(0, 4))
-        tk.Label(dialog, text="填 0 或留空 = 自动学习；OOM 后自动提高门槛。", bg=COLORS["surface"], fg="#9aa7a0", font=(FONT, 8)).grid(row=15, column=1, sticky="w", padx=(10, 25), pady=(0, 8))
-        self._checkbutton(dialog, text="显存不足后自动等待重试", variable=auto_var).grid(row=16, column=0, columnspan=2, sticky="w", padx=25, pady=(0, 8))
-        buttons = tk.Frame(dialog, bg=COLORS["surface"])
-        buttons.grid(row=17, column=0, columnspan=2, sticky="e", padx=25, pady=18)
-        tk.Button(buttons, text="取消", command=dialog.destroy, relief="flat", bd=0, bg=COLORS["surface"], fg=COLORS["muted"], font=(FONT, 9), padx=10, pady=7).pack(side="left", padx=5)
-        submit = tk.Button(buttons, text="保存并重新等待  →" if editing else "加入队列  →", relief="flat", bd=0, bg=COLORS["green"], fg="#ffffff", font=(FONT, 9, "bold"), padx=13, pady=7)
-        submit.pack(side="left", padx=5)
+        self._entry(scheduling, textvariable=memory_var, width=35).grid(row=10, column=0, sticky="ew", padx=18, pady=(0, 6))
+        tk.Label(scheduling, text="填 0 或留空 = 自动学习；OOM 后自动提高门槛。", bg=COLORS["surface"], fg="#7a8ba2", font=(FONT, 8), wraplength=340, justify="left", anchor="w").grid(row=11, column=0, sticky="ew", padx=18, pady=(0, 6))
+        self._checkbutton(scheduling, text="显存不足后自动等待重试", variable=auto_var).grid(row=13, column=0, sticky="w", padx=18, pady=(12, 18))
+        buttons = tk.Frame(footer, bg=COLORS["surface"])
+        buttons.pack(side="right")
+        self._button(buttons, text="取消", command=dialog.destroy, variant='secondary').pack(side="left", padx=(0, 8))
+        submit = self._button(buttons, text="保存并重新等待  →" if editing else "加入队列  →", variant='primary')
+        submit.pack(side="left", padx=(0, 8))
 
         def update_util_entry(_event: Any = None) -> None:
             max_util_entry.configure(state="normal" if EXECUTION_LEVEL_KEYS.get(level_var.get()) == "low_interference" else "disabled")
@@ -2475,7 +2732,7 @@ class DesktopClient(tk.Tk):
         def submit_experiment() -> None:
             script = path_var.get()
             if not script or not Path(script).is_file():
-                messagebox.showwarning("缺少脚本", "请选择一个 .sh 文件。", parent=dialog)
+                self._message("warning", "缺少脚本", "请选择一个 .sh 文件。", parent=dialog)
                 return
             name = clean_name(name_var.get(), Path(script).stem)
             level = EXECUTION_LEVEL_KEYS.get(level_var.get(), "idle_only")
@@ -2495,7 +2752,7 @@ class DesktopClient(tk.Tk):
                 dialog.destroy()
                 self.set_status("实验配置已更新并重新进入等待队列" if editing else "实验已加入队列")
             except Exception as exc:
-                messagebox.showerror("提交失败", str(exc), parent=dialog)
+                self._message("error", "提交失败", str(exc), parent=dialog)
 
         submit.configure(command=submit_experiment)
 
@@ -2709,7 +2966,7 @@ class DesktopClient(tk.Tk):
             self.set_status("正在执行或已暂停进程的任务不能直接删除，请先中断任务", True)
             return
         task_name = f"{task_identifier(item)}  {item.get('name') or item.get('script_name') or '实验任务'}"
-        confirmed = messagebox.askyesno(
+        confirmed = self._message("question",
             "删除实验任务",
             f"确定删除 {task_name} 吗？\n\n本地任务记录和脚本缓存会删除，服务器上的历史日志会保留。",
             parent=self,
@@ -2788,7 +3045,7 @@ class DesktopClient(tk.Tk):
                 fp32 = result.get("fp32_tflops", "—")
                 self.after(0, lambda: self.set_status(f"GPU {gpu_index} 测试完成：Tensor {tensor} / FP32 {fp32} TFLOPS"))
             except Exception as exc:
-                self.after(0, lambda: (self.set_status(f"GPU {gpu_index} 测试失败：{exc}", True), messagebox.showerror("GPU 测试失败", str(exc), parent=self)))
+                self.after(0, lambda: (self.set_status(f"GPU {gpu_index} 测试失败：{exc}", True), self._message("error", "GPU 测试失败", str(exc), parent=self)))
             finally:
                 self.benchmark_running.discard(key)
                 self.after(0, self.refresh_state)
