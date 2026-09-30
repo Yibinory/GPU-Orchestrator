@@ -46,7 +46,7 @@ def _enable_windows_dpi_awareness() -> None:
 _enable_windows_dpi_awareness()
 
 import tkinter as tk
-from tkinter import filedialog, ttk
+from tkinter import filedialog, font as tkfont, ttk
 
 from app import Runtime, UPLOAD_DIR, clean_name, now_iso, runtime as default_runtime, safe_float, safe_int, store
 
@@ -192,6 +192,167 @@ class ResourceBar(tk.Canvas):
         if key in ("value", "maximum"):
             return getattr(self, "_" + key)
         return super().__getitem__(key)
+
+
+class RoundedPanel(tk.Frame):
+    """A native panel with a rounded outline and an ordinary layout container."""
+
+    def __init__(self, parent: tk.Misc, fill: str, outline: str = "#e2ece8", padding: int = 18, radius: int = 14) -> None:
+        super().__init__(parent, bg=parent.cget("bg"), bd=0)
+        self.backdrop = tk.Canvas(self, bg=self.cget("bg"), bd=0, highlightthickness=0)
+        self.backdrop.place(x=0, y=0, relwidth=1, relheight=1)
+        self.body = tk.Frame(self, bg=fill, bd=0)
+        self.body.pack(fill="both", expand=True, padx=padding, pady=padding)
+        self.backdrop.tk.call("lower", self.backdrop._w)
+        shape = self.backdrop.create_polygon(0, 0, 0, 0, smooth=True, splinesteps=24, fill=fill, outline=outline, width=1)
+
+        def draw(event: Any) -> None:
+            x, y = max(1, event.width - 1), max(1, event.height - 1)
+            r = min(radius, x / 2, y / 2)
+            self.backdrop.coords(shape, r, 1, x - r, 1, x, 1, x, r, x, y - r, x, y, x - r, y, r, y, 1, y, 1, y - r, 1, r, 1, 1)
+
+        self.backdrop.bind("<Configure>", draw)
+
+
+class GPUProcessCard(RoundedPanel):
+    """Keep command widgets alive while live process counters change."""
+
+    def __init__(self, parent: tk.Misc, wheel: Any) -> None:
+        super().__init__(parent, "#f7faf9", padding=18)
+        self.command_value: str | None = None
+        self.resize_after: str | None = None
+        self.copy_after: str | None = None
+        self.fit_signature: tuple[Any, ...] | None = None
+        self.character_widths: dict[str, int] = {}
+        self.head_layout: tuple[Any, ...] | None = None
+        self.meta_values: tuple[str, ...] | None = None
+        self.head = tk.Frame(self.body, bg=self.body.cget("bg"))
+        self.head.pack(fill="x", pady=(0, 12))
+        self.head.columnconfigure(0, weight=1)
+        identity = tk.Frame(self.head, bg=self.body.cget("bg"))
+        identity.grid(row=0, column=0, sticky="w")
+        self.avatar = tk.Canvas(identity, width=40, height=40, bg=self.body.cget("bg"), highlightthickness=0)
+        self.avatar.pack(side="left", padx=(0, 12))
+        self.avatar.create_oval(0, 0, 40, 40, fill="#def7ee", outline="")
+        self.initial = self.avatar.create_text(20, 20, fill=COLORS["green_dark"], font=(MONO, 13, "bold"))
+        self.user = tk.Label(identity, bg=self.body.cget("bg"), fg=COLORS["ink"], font=(FONT, 11, "bold"), anchor="w")
+        self.user.pack(side="left")
+        self.meta = tk.Frame(self.head, bg=self.body.cget("bg"))
+        self.meta.grid(row=0, column=1, sticky="e")
+        self.meta_labels = []
+        for index in range(3):
+            fill = "#e8eff0" if index < 2 else "#e8f0ff"
+            chip = RoundedPanel(self.meta, fill, outline=fill, padding=6, radius=8)
+            chip.pack(side="left", padx=(8 if index else 0, 0))
+            label = tk.Label(chip.body, bg=fill, fg=COLORS["muted"] if index < 2 else "#416bb5", font=(MONO, 10, "bold"), padx=4)
+            label.pack()
+            self.meta_labels.append(label)
+
+        def reflow(event: Any) -> None:
+            # Use the unwrapped username width, so changing the layout does not
+            # change the condition that chose it and make the rows oscillate.
+            user_width = min(320, self.user_font.measure(self.user.cget("text")))
+            meta_width = self.meta.winfo_reqwidth()
+            narrow = event.width < user_width + meta_width + 76
+            wrap = max(100, event.width - 64 - (0 if narrow else meta_width + 24))
+            signature = (narrow, wrap)
+            if signature != self.head_layout:
+                self.head_layout = signature
+                self.meta.grid(row=1 if narrow else 0, column=0 if narrow else 1, sticky="w" if narrow else "e", pady=(10, 0) if narrow else 0)
+                self.user.configure(wraplength=wrap)
+
+        self.user_font = tkfont.Font(self, font=self.user.cget("font"))
+        self.head.bind("<Configure>", reflow)
+        command_heading = tk.Frame(self.body, bg=self.body.cget("bg"))
+        command_heading.pack(fill="x", pady=(0, 8))
+        tk.Label(command_heading, text="命令", bg=self.body.cget("bg"), fg=COLORS["muted"], font=(FONT, 9)).pack(side="left")
+        ttk.Style(self).configure("ProcessCopy.secondary.TButton", font=(FONT, 8), padding=(8, 4), background=self.body.cget("bg"))
+        self.copy_button = ttk.Button(command_heading, text="复制命令", command=self.copy_command, style="ProcessCopy.secondary.TButton", cursor="hand2", width=0)
+        self.copy_button.pack(side="right")
+        terminal = RoundedPanel(self.body, "#142f2b", outline="#142f2b", padding=14, radius=12)
+        terminal.pack(fill="x")
+        self.command_font = tkfont.Font(self, font=(MONO, 11))
+        self.command_text = tk.Text(terminal.body, width=1, height=1, wrap="char", bg="#142f2b", fg="#aed0c0", font=self.command_font, tabs=(self.command_font.measure("0") * 8,), tabstyle="wordprocessor", spacing1=2, spacing3=2, padx=0, pady=0, bd=0, highlightthickness=0, selectbackground="#286458", selectforeground="#ffffff", cursor="xterm", exportselection=False)
+        self.command_text.pack(fill="x")
+        self.command_text.configure(state="disabled")
+        self.command_text.bind("<Configure>", lambda _event: self.fit_command())
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.command_text.bind(sequence, wheel)
+        self.bind("<Destroy>", self._cancel_callbacks, add="+")
+
+    def fit_command(self) -> None:
+        if self.resize_after is None:
+            self.resize_after = self.after_idle(self._fit_command)
+
+    def _fit_command(self) -> None:
+        self.resize_after = None
+        width = self.command_text.winfo_width()
+        if width < 32 or not self.command_text.winfo_ismapped():
+            # Wait for Configure with real geometry rather than measuring a
+            # hidden one-pixel widget during dialog construction.
+            return
+        signature = (self.command_value, width, self.command_font.metrics("linespace"))
+        if signature == self.fit_signature:
+            return
+        if self.fit_signature and signature[2] != self.fit_signature[2]:
+            self.character_widths.clear()
+        self.fit_signature = signature
+        height, occupied = 1, 0
+        tab_width = self.command_font.measure("0") * 8
+        for character in self.command_value or "":
+            if character == "\n":
+                height, occupied = height + 1, 0
+                continue
+            if character not in self.character_widths:
+                self.character_widths[character] = self.command_font.measure(character)
+            advance = tab_width - occupied % tab_width if character == "\t" else self.character_widths[character]
+            if occupied and occupied + advance > width:
+                height, occupied = height + 1, 0
+                if character == "\t":
+                    advance = tab_width
+            occupied += advance
+        # Leave one line of breathing room for fallback-font rounding; never
+        # ask Tk to lay out/count every display line on the UI thread.
+        height += 1
+        if int(self.command_text.cget("height")) != height:
+            self.command_text.configure(height=height)
+
+    def update_process(self, process: dict[str, Any]) -> None:
+        user = str(process.get("user") or "未知用户")
+        if self.user.cget("text") != user:
+            self.user.configure(text=user)
+            self.avatar.itemconfigure(self.initial, text=user[:1].upper())
+        values = (f"PID {process.get('pid') or '—'}", f"已运行 {fmt_duration(process.get('runtime_seconds'))}", fmt_mb(process.get("memory_mb")))
+        for index, (label, value) in enumerate(zip(self.meta_labels, values)):
+            if self.meta_values is None or self.meta_values[index] != value:
+                label.configure(text=value)
+        self.meta_values = values
+        command = str(process.get("command") or process.get("name") or "暂无命令信息")
+        if command != self.command_value:
+            self.command_value = command
+            self.command_text.configure(state="normal")
+            self.command_text.delete("1.0", "end")
+            self.command_text.insert("1.0", command)
+            self.command_text.configure(state="disabled")
+            self.fit_command()
+
+    def copy_command(self) -> None:
+        self.clipboard_clear()
+        self.clipboard_append(self.command_value or "")
+        if self.copy_after is not None:
+            self.after_cancel(self.copy_after)
+        self.copy_button.configure(text="已复制")
+        self.copy_after = self.after(1600, self._restore_copy_label)
+
+    def _restore_copy_label(self) -> None:
+        self.copy_after = None
+        self.copy_button.configure(text="复制命令")
+
+    def _cancel_callbacks(self, event: Any) -> None:
+        if event.widget == self:
+            for callback in (self.resize_after, self.copy_after):
+                if callback is not None:
+                    self.after_cancel(callback)
 
 
 class DesktopRuntimeManager:
@@ -1786,64 +1947,124 @@ class DesktopClient(tk.Tk):
             speed = f"{float(bench.get('tensor_tflops')):.2f} TFLOPS" if bench.get("tensor_tflops") else "未测试"
             widget["speed"].configure(text=speed)
 
-    def show_gpu_detail(self, server_id: str, gpu_index: int) -> None:
+    def show_gpu_detail(self, server_id: str, gpu_index: int) -> tk.Toplevel:
+        dialogs = self.__dict__.setdefault("gpu_detail_dialogs", {})
+        key = (server_id, gpu_index)
+        existing = dialogs.get(key)
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            existing.focus_set()
+            return existing
         server = next((item for item in self.state.get("servers", []) if item.get("id") == server_id), {})
-        dialog, content, footer = self._dialog(f"GPU {gpu_index} 详情", "GPU INSPECTOR", f"{server.get('name') or server_id} · 实时资源与计算进程", size=(960, 680), card=False, modal=False)
+        dialog, content, footer = self._dialog(f"GPU {gpu_index} 进程详情", "GPU PROCESSES", f"{server.get('name') or server_id} · 实时资源与计算进程", size=(1040, 900), card=False, modal=False)
+        dialogs[key] = dialog
         self._button(footer, "关闭", dialog.destroy).pack(side="right")
-        title_var = tk.StringVar(value=f"GPU {gpu_index}")
-        subtitle_var = tk.StringVar(value=server.get("name") or server.get("host") or server_id)
+        summary_panel = RoundedPanel(content, "#f7faf9")
+        summary_panel.pack(fill="x", pady=(0, 18))
+        summary = summary_panel.body
+        model = tk.Label(summary, text="等待 GPU 数据", bg=summary.cget("bg"), fg=COLORS["ink"], font=(FONT, 12, "bold"), anchor="w")
+        model.pack(fill="x", pady=(0, 12))
+        model.bind("<Configure>", lambda event: model.configure(wraplength=max(1, event.width)))
+        chips = tk.Frame(summary, bg=summary.cget("bg"))
+        chips.pack(fill="x", pady=(0, 14))
+        summary_labels = []
+        summary_chips = []
+        for index in range(3):
+            fill = "#e8f0ff" if index == 1 else "#e8eff0"
+            chip = RoundedPanel(chips, fill, outline=fill, padding=6, radius=8)
+            label = tk.Label(chip.body, bg=fill, fg="#416bb5" if index == 1 else COLORS["muted"], font=(MONO, 10, "bold"), padx=4)
+            label.pack()
+            summary_labels.append(label)
+            summary_chips.append(chip)
+
+        def reflow_chips(event: Any) -> None:
+            row, column, occupied = 0, 0, 0
+            for chip in summary_chips:
+                width = chip.winfo_reqwidth() + 10
+                if occupied and occupied + width > event.width:
+                    row, column, occupied = row + 1, 0, 0
+                chip.grid(row=row, column=column, sticky="w", padx=(0, 10), pady=(0, 6))
+                column, occupied = column + 1, occupied + width
+
+        chips.bind("<Configure>", reflow_chips)
+        resources = tk.Frame(summary, bg=summary.cget("bg"))
+        resources.pack(fill="x")
+        resources.columnconfigure(0, weight=1, uniform="detail")
+        resources.columnconfigure(1, weight=1, uniform="detail")
         memory_var = tk.StringVar(value="显存：—")
         usage_var = tk.StringVar(value="利用率：—")
-        temperature_var = tk.StringVar(value="温度：—")
-        status_var = tk.StringVar(value="状态：—")
-        tk.Label(content, textvariable=title_var, bg=COLORS["bg"], fg=COLORS["ink"], font=(FONT, 13, "bold"), anchor="w").pack(fill="x", pady=(0, 14))
-        summary = tk.Frame(content, bg=COLORS["bg"])
-        summary.pack(fill="x", pady=(0, 16))
-        summary.columnconfigure(0, weight=1, uniform="detail")
-        summary.columnconfigure(1, weight=1, uniform="detail")
         detail_bars = []
-        for index, variable in enumerate((memory_var, usage_var, temperature_var, status_var)):
-            card = self._card(summary)
-            card.grid(row=index // 2, column=index % 2, sticky="nsew", padx=(0 if index % 2 == 0 else 12, 0), pady=(0, 10))
-            tk.Label(card, textvariable=variable, bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 10), anchor="w").pack(fill="x", padx=16, pady=(14, 10))
-            if index < 2:
-                bar = ResourceBar(card, "Purple.Horizontal.TProgressbar" if index == 0 else "Green.Horizontal.TProgressbar")
-                bar.pack(fill="x", padx=16, pady=(0, 14))
-                detail_bars.append(bar)
-        process_card = self._card(content)
-        process_card.pack(fill="both", expand=True)
-        tk.Label(process_card, text="运行中的计算进程", bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 13, "bold")).pack(anchor="w", padx=16, pady=(14, 10))
-        process_frame = tk.Frame(process_card, bg=COLORS["surface"])
-        process_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-        columns = ("name", "pid", "memory", "runtime")
-        process_tree = ttk.Treeview(process_frame, columns=columns, show="headings")
-        headings = {"name": "程序", "pid": "PID", "memory": "显存占用", "runtime": "已运行时间"}
-        widths = {"name": 390, "pid": 90, "memory": 130, "runtime": 150}
-        for column in columns:
-            process_tree.heading(column, text=headings[column])
-            process_tree.column(column, width=widths[column], anchor="w")
-        process_frame.rowconfigure(0, weight=1)
-        process_frame.columnconfigure(0, weight=1)
-        process_tree.grid(row=0, column=0, sticky="nsew")
-        process_scroll = ttk.Scrollbar(process_frame, orient="vertical", command=process_tree.yview)
-        process_scroll.grid(row=0, column=1, sticky="ns")
-        process_horizontal = ttk.Scrollbar(process_frame, orient="horizontal", command=process_tree.xview)
-        process_horizontal.grid(row=1, column=0, sticky="ew")
-        process_tree.configure(yscrollcommand=process_scroll.set, xscrollcommand=process_horizontal.set)
+        for index, variable in enumerate((memory_var, usage_var)):
+            metric = tk.Frame(resources, bg=summary.cget("bg"))
+            metric.grid(row=0, column=index, sticky="ew", padx=(0, 18) if index == 0 else 0)
+            label = tk.Label(metric, textvariable=variable, bg=summary.cget("bg"), fg=COLORS["muted"], font=(FONT, 9), anchor="w", justify="left")
+            label.pack(fill="x", pady=(0, 6))
+            label.bind("<Configure>", lambda event, target=label: target.configure(wraplength=max(1, event.width)))
+            bar = ResourceBar(metric, "Purple.Horizontal.TProgressbar" if index == 0 else "Green.Horizontal.TProgressbar")
+            bar.pack(fill="x")
+            detail_bars.append(bar)
+        toolbar = tk.Frame(content, bg=content.cget("bg"))
+        toolbar.pack(fill="x", pady=(0, 10))
+        tk.Label(toolbar, text="运行中的计算进程", bg=toolbar.cget("bg"), fg=COLORS["ink"], font=(FONT, 11, "bold")).pack(side="left")
+        tk.Label(toolbar, text="每 2 秒自动更新 · 按显存排序", bg=toolbar.cget("bg"), fg=COLORS["muted"], font=(FONT, 8)).pack(side="right")
+        process_frame = tk.Frame(content, bg=content.cget("bg"))
+        process_frame.pack(fill="both", expand=True)
+        canvas = tk.Canvas(process_frame, bg=content.cget("bg"), bd=0, highlightthickness=0, yscrollincrement=24)
+        scrollbar = ttk.Scrollbar(process_frame, orient="vertical", command=canvas.yview)
+        scrollbar.pack(side="right", fill="y", padx=(10, 0))
+        canvas.pack(side="left", fill="both", expand=True)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        process_list = tk.Frame(canvas, bg=content.cget("bg"))
+        window = canvas.create_window(0, 0, anchor="nw", window=process_list)
+        process_list.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=event.width))
 
-        def update() -> None:
-            if not dialog.winfo_exists():
-                return
+        def wheel(event: Any) -> str | None:
+            if process_list in self._widget_ancestors(event.widget) or event.widget == canvas:
+                region = canvas.bbox("all")
+                if region and region[3] > canvas.winfo_height():
+                    canvas.yview_scroll(-3 if getattr(event, "delta", 0) > 0 or getattr(event, "num", None) == 4 else 3, "units")
+                return "break"
+            return None
+
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            dialog.bind(sequence, wheel, add="+")
+        cards: dict[str, GPUProcessCard] = {}
+        order: list[str] = []
+        empty = RoundedPanel(process_list, "#f7faf9", padding=30)
+        empty_title = tk.Label(empty.body, bg=empty.body.cget("bg"), fg=COLORS["ink"], font=(FONT, 12, "bold"))
+        empty_title.pack(pady=(8, 10))
+        empty_hint = tk.Label(empty.body, bg=empty.body.cget("bg"), fg=COLORS["muted"], font=(FONT, 9), wraplength=480)
+        empty_hint.pack(pady=(0, 8))
+        timer: str | None = None
+        scroll_after: str | None = None
+        build_after: str | None = None
+
+        def restore_scroll(position: float) -> None:
+            nonlocal scroll_after
+            scroll_after = None
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.yview_moveto(position)
+
+        def refresh() -> None:
+            nonlocal order, scroll_after, build_after
+            if build_after is not None:
+                dialog.after_cancel(build_after)
+                build_after = None
             state = self.state.get("server_states", {}).get(server_id)
             if not state and server_id == self.state.get("active_server_id"):
                 state = self.state
             gpu = next((item for item in ((state or {}).get("snapshot") or {}).get("gpus", []) if safe_int(item.get("index"), -1) == gpu_index), None)
+            if (state or {}).get("connected") is False:
+                gpu = None
+            processes = sorted((gpu or {}).get("processes") or [], key=lambda item: safe_int(item.get("memory_mb"), 0), reverse=True)
             if not gpu:
-                title_var.set(f"GPU {gpu_index} · 暂无数据")
+                model.configure(text=f"GPU {gpu_index} · 暂无数据")
+                for label in summary_labels:
+                    label.configure(text="—")
                 memory_var.set("显存：—")
                 usage_var.set("利用率：—")
-                temperature_var.set("温度：—")
-                status_var.set("状态：未连接")
                 for bar in detail_bars:
                     bar["value"] = 0
             else:
@@ -1851,25 +2072,85 @@ class DesktopClient(tk.Tk):
                 used = safe_int(gpu.get("memory_used_mb"), 0)
                 free = safe_int(gpu.get("memory_free_mb"), 0)
                 percent = used / max(total, 1) * 100
-                title_var.set(f"GPU {gpu_index} · {gpu.get('name', 'Unknown GPU')}")
-                memory_var.set(f"显存：{percent:.1f}% · {free:,} MB 可用")
-                usage_var.set(f"利用率：{float(gpu.get('utilization_gpu') or 0):.1f}%")
-                detail_bars[0]["value"] = percent
-                detail_bars[1]["value"] = float(gpu.get("utilization_gpu") or 0)
-                temperature_var.set(f"温度：{gpu.get('temperature_c', '—')}°C")
+                utilization = safe_float(gpu.get("utilization_gpu"), 0)
+                model.configure(text=gpu.get("name") or "Unknown GPU")
+                summary_labels[0].configure(text=f"{len(processes)} 个进程")
+                summary_labels[1].configure(text=f"进程显存合计 {fmt_mb(sum(safe_int(item.get('memory_mb'), 0) for item in processes))}")
                 idle = bool(gpu.get("scheduler_idle")) and not gpu.get("reserved_mb")
-                status_var.set("状态：空闲可调度" if idle else f"状态：{gpu.get('process_count', 0)} 个进程")
-                for row in process_tree.get_children():
-                    process_tree.delete(row)
-                processes = gpu.get("processes") or []
-                if not processes:
-                    process_tree.insert("", "end", values=("暂无可见计算进程", "—", "—", "—"))
-                else:
-                    for process in processes:
-                        process_tree.insert("", "end", values=(process.get("name") or "未知程序", process.get("pid") or "—", f"{safe_int(process.get('memory_mb'), 0):,} MB", fmt_duration(process.get("runtime_seconds"))))
-            dialog.after(2000, update)
+                status = "空闲可调度" if idle else "队列已占用" if gpu.get("reserved_mb") else f"{gpu.get('process_count', len(processes))} 个进程运行中"
+                temperature = gpu.get("temperature_c")
+                summary_labels[2].configure(text=f"{temperature if temperature is not None else '—'}°C · {status}")
+                memory_var.set(f"显存 {percent:.1f}% · {free:,} MB 可用 / {total:,} MB")
+                usage_var.set(f"利用率 {utilization:.1f}%")
+                detail_bars[0]["value"] = percent
+                detail_bars[1]["value"] = utilization
 
+            keys = [str(item.get("pid") or f"unknown-{index}") for index, item in enumerate(processes)]
+            previous_scroll = canvas.yview()[0]
+            for key in set(cards) - set(keys):
+                cards.pop(key).destroy()
+            for key, process in zip(keys, processes):
+                if key in cards:
+                    cards[key].update_process(process)
+            changed_order = keys != order
+            if keys != order:
+                empty.pack_forget()
+                for card in cards.values():
+                    card.pack_forget()
+                for key in keys:
+                    if key in cards:
+                        cards[key].pack(fill="x", pady=(0, 12))
+                order = keys
+
+            pending = [(key, process) for key, process in zip(keys, processes) if key not in cards]
+
+            def build_batch() -> None:
+                nonlocal build_after, scroll_after
+                build_after = None
+                # Creating/mapping dozens of native widgets in one event also
+                # delays input. A short batch keeps the window responsive.
+                for key, process in pending[:4]:
+                    card = cards[key] = GPUProcessCard(process_list, wheel)
+                    card.update_process(process)
+                    following = next((cards[candidate] for candidate in keys[keys.index(key) + 1:] if candidate in cards), None)
+                    options = {"before": following} if following is not None else {}
+                    card.pack(fill="x", pady=(0, 12), **options)
+                del pending[:4]
+                if pending:
+                    build_after = dialog.after(12, build_batch)
+                elif changed_order and previous_scroll:
+                    # Let the normal event loop settle geometry; never drain
+                    # all idle callbacks synchronously while opening a dialog.
+                    if scroll_after is not None:
+                        dialog.after_cancel(scroll_after)
+                    scroll_after = dialog.after_idle(lambda: restore_scroll(previous_scroll))
+
+            if len(pending) > 6:
+                build_after = dialog.after(12, build_batch)
+            else:
+                build_batch()
+            if not processes:
+                empty_title.configure(text="暂无该显卡数据" if not gpu else "该显卡当前没有计算进程" if not gpu.get("process_count") else "暂时无法读取进程详情")
+                empty_hint.configure(text="服务器连接恢复后将自动更新。" if not gpu else "新的计算进程出现后，将自动显示在这里。" if not gpu.get("process_count") else "服务器已检测到计算进程，但尚未返回详情；将继续自动刷新。")
+                empty.pack(fill="x")
+
+        def update() -> None:
+            nonlocal timer
+            refresh()
+            timer = dialog.after(2000, update)
+
+        def cancel_update(event: Any) -> None:
+            if event.widget == dialog:
+                for callback in (timer, scroll_after, build_after):
+                    if callback is not None:
+                        dialog.after_cancel(callback)
+                if dialogs.get(key) == dialog:
+                    dialogs.pop(key)
+
+        self._button(footer, "刷新", refresh, "soft").pack(side="right", padx=(0, 10))
+        dialog.bind("<Destroy>", cancel_update, add="+")
         update()
+        return dialog
 
     def render_activity(self) -> None:
         items = sorted(self.state.get("experiments", []), key=lambda item: safe_int(item.get("created_seq"), 0), reverse=True)[:5]

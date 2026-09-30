@@ -23,6 +23,14 @@ def fixture() -> dict:
         gpus = [dict(index=i, name="NVIDIA GeForce RTX 4090", uuid=f"GPU-demo-{i:04d}", memory_total_mb=24576, memory_used_mb=6000 + i * 2000, memory_free_mb=18576 - i * 2000, utilization_gpu=12 + i * 20, temperature_c=42 + i * 6, scheduler_idle=i == 0, process_count=i, benchmark=dict(tensor_tflops=76.3 + i, fp32_tflops=30.8), processes=[]) for i in range(4 if server["id"] == "default" else 2)]
         states[server["id"]] = dict(connected=True, last_poll_at="2026-09-30T06:00:00+00:00", conda=dict(envs=["pytorch", "inference"]), preferences={}, snapshot=dict(cpu_percent=24.5, load_average=[2.4], memory=dict(total_bytes=128 * 1024**3, used_bytes=48 * 1024**3, used_percent=37.5), disk=dict(path="/home/research", total_bytes=2 * 1024**4, used_bytes=1024**4, free_bytes=1024**4, used_percent=50), gpus=gpus))
     tasks = [dict(id=f"demo-{i}", task_no=i + 1, created_seq=i + 1, name=f"模型训练实验 {i + 1:02d}", script_name=f"train_{i + 1:02d}.sh", server_id="default" if i % 2 else "second", status=("queued", "running", "paused", "success", "failed", "waiting_memory", "canceled")[i % 7], priority=10 + i, execution_level=("idle_only", "low_interference", "emergency")[i % 3], max_gpu_utilization=30, peak_memory_mb=12000, depends_on=[], created_at="2026-09-30T05:00:00+00:00") for i in range(32)]
+    for state in states.values():
+        gpu = state["snapshot"]["gpus"][0]
+        gpu.update(process_count=3, scheduler_idle=False, processes=[
+            dict(pid=3958223, user="research", name="python3", memory_mb=12024, runtime_seconds=93601, command="/home/research/miniconda3/envs/pytorch/bin/python -u train.py --model vision-language-large --dataset /data/datasets/visual_reasoning --checkpoint /data/checkpoints/pretrained/model.safetensors --precision bf16 --batch_size 2 --gradient_accumulation_steps 10 --experiment_name vision-language-training"),
+            dict(pid=3144207, user="alice", name="python3", memory_mb=6022, runtime_seconds=27060, command="/data/projects/multimodal-retrieval/conda-env/bin/python /data/projects/multimodal-retrieval/src/train.py experiment=alignment_train data_dir=/data/datasets/semantic_retrieval checkpoint_dir=/data/checkpoints/alignment seed=2026 train=true"),
+            dict(pid=3412244, user="bob", name="python3", memory_mb=628, runtime_seconds=14340, command="/home/bob/miniconda3/envs/inference/bin/python -m inference.server --config /data/configs/inference.yaml --port 8080"),
+        ])
+        gpu.update(memory_used_mb=18674, memory_free_mb=5902, utilization_gpu=99, temperature_c=76)
     return dict(servers=servers, server_states=states, experiments=tasks, active_server_id="default", global_settings=dict(gpu_history_samples=5), preferences={}, profile={}, benchmarks=[])
 
 
@@ -163,6 +171,98 @@ def run() -> None:
                             assert widget.tk.getboolean(widget.tk.globalgetvar(variable)) != before, "Checkbox no longer toggles"
                             widget.invoke()
                     dialog.destroy()
+            # Exercise the live process inspector, including command wrapping,
+            # copy fidelity, card reuse, process churn and disconnected data.
+            # Freeze the fixture poll while mutating this snapshot; the dialog's
+            # own refresh timer remains active and is exercised below.
+            if client.refresh_after_id is not None:
+                client.after_cancel(client.refresh_after_id)
+                client.refresh_after_id = None
+            dialog = client.show_gpu_detail("default", 0)
+            client.update()
+            refresh = next(w for w in descendants(dialog.ui_footer) if w.winfo_class() == "TButton" and w.cget("text") == "刷新")
+            def process_cards():
+                return sorted([w for w in descendants(dialog) if isinstance(w, ui.GPUProcessCard)], key=lambda w: w.winfo_y())
+            cards = process_cards()
+            assert [w.user.cget("text") for w in cards] == ["research", "alice", "bob"]
+            gpu = client.state["server_states"]["default"]["snapshot"]["gpus"][0]
+            saved_gpu = copy.deepcopy(gpu)
+            for card, process in zip(cards, gpu["processes"]):
+                assert card.command_text.get("1.0", "end-1c") == process["command"], "Command truncated"
+                assert str(card.command_text.cget("state")) == "disabled", "Command is editable"
+            canvas = cards[0].master.master
+            first = cards[0]
+            first.command_text.tag_add("sel", "1.0", "1.12")
+            canvas.yview_moveto(0.3)
+            client.update()
+            position = canvas.yview()[0]
+            gpu["processes"][0]["runtime_seconds"] += 30
+            refresh.invoke()
+            client.update()
+            assert process_cards() == cards, "Refresh rebuilt unchanged process cards"
+            assert first.command_text.tag_ranges("sel"), "Refresh erased command selection"
+            assert abs(canvas.yview()[0] - position) < 0.02, "Refresh reset scroll position"
+            assert "02:00:31" in first.meta_labels[1].cget("text"), "Runtime counter not refreshed"
+            # Capture clipboard writes in memory; leave the user's clipboard alone.
+            clipboard = []
+            first.clipboard_clear = clipboard.clear
+            first.clipboard_append = clipboard.append
+            first.copy_button.invoke()
+            assert clipboard == [gpu["processes"][0]["command"]], "Copy changed command contents"
+            long_command = "python /data/训练/train.py --config 'quoted path.yaml'\n--payload=" + "x" * 2400
+            gpu["processes"][0]["command"] = long_command
+            gpu["processes"][0]["user"] = "research-user-with-a-long-name"
+            refresh.invoke()
+            for width in (640, 1040):
+                dialog.geometry(f"{width}x820")
+                client.update()
+                assert first.command_text.get("1.0", "end-1c") == long_command
+                display_lines = first.command_text.count("1.0", "end-1c", "displaylines")[0] + 1
+                assert int(first.command_text.cget("height")) >= display_lines, "Wrapped command clipped"
+                assert first.meta.winfo_x() + first.meta.winfo_width() <= first.head.winfo_width() + 1, "Process metadata clipped"
+                assert dialog.ui_footer.winfo_ismapped(), "Close actions scrolled away"
+            first.copy_button.invoke()
+            assert clipboard == [long_command], "Long command copy truncated"
+            first.command_text.event_generate("<MouseWheel>", delta=-120)
+            client.update()
+            assert canvas.yview()[0] > 0, "Wheel over command does not scroll process list"
+            gpu["processes"][2]["memory_mb"] = 16000
+            refresh.invoke()
+            client.update()
+            assert process_cards()[0] == cards[2], "Processes not sorted by memory"
+            gpu["processes"] = [dict(pid=778899, memory_mb=256, name="legacy-python", runtime_seconds=10)]
+            refresh.invoke()
+            client.update()
+            legacy = process_cards()[0]
+            assert len(process_cards()) == 1 and legacy.user.cget("text") == "未知用户"
+            assert legacy.command_text.get("1.0", "end-1c") == "legacy-python", "Older agent fallback broken"
+            gpu.update(processes=[], process_count=0)
+            refresh.invoke()
+            client.update()
+            assert not process_cards(), "Exited processes still visible"
+            assert any(w.winfo_ismapped() and w.winfo_class() == "Label" and w.cget("text") == "该显卡当前没有计算进程" for w in descendants(dialog))
+            gpu.update(copy.deepcopy(saved_gpu))
+            refresh.invoke()
+            client.update()
+            assert len(process_cards()) == 3, "New processes did not appear"
+            client.state["server_states"]["default"]["connected"] = False
+            refresh.invoke()
+            client.update()
+            assert not process_cards(), "Disconnected inspector shows stale processes"
+            assert all(w["value"] == 0 for w in descendants(dialog) if isinstance(w, ui.ResourceBar))
+            client.state = copy.deepcopy(data)
+            refresh.invoke()
+            client.update()
+            assert len(process_cards()) == 3, "Reconnect did not restore inspector"
+            client.state["server_states"]["default"]["snapshot"]["gpus"][0]["processes"][0]["runtime_seconds"] += 60
+            client.after(2100, client.quit)
+            client.mainloop()
+            assert "02:01:01" in process_cards()[0].meta_labels[1].cget("text"), "Automatic refresh did not update process counters"
+            dialog.destroy()
+            client.after(2200, client.quit)
+            client.mainloop()
+            assert not errors, "Destroyed inspector left a scheduled callback"
+            client.refresh_state()
             # Full logs use a fake connected runtime; the network worker stays
             # disconnected and the data source contains only synthetic text.
             runtime_for = client.manager.runtime_for
@@ -233,7 +333,7 @@ def run() -> None:
                 client._show_view(view)
                 client.update()
             assert not errors, errors
-            print("PASS: five views at three sizes; visible resource bars at 0/6.1/50/100%; enlarged logo; queue actions and filters; scrollable logs; GPU resize; six themed dialogs; dropdowns, numeric input and checkboxes; four message/confirmation styles; new/edit form payloads including dependencies; empty states; no Tk callback errors.")
+            print("PASS: five views at three sizes; visible resource bars at 0/6.1/50/100%; enlarged logo; queue actions and filters; scrollable logs; GPU resize; six themed dialogs; live GPU process cards, exact command copy and wrapping, narrow layout, sorting and process churn, offline/reconnect states, callback cleanup; dropdowns, numeric input and checkboxes; four message/confirmation styles; new/edit form payloads including dependencies; empty states; no Tk callback errors.")
         finally:
             client.destroy()
 
