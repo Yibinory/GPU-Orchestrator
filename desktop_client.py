@@ -176,6 +176,10 @@ class ResourceBar(tk.Canvas):
 
     def _draw(self, _event: Any = None) -> None:
         width, height = self.winfo_width(), self.winfo_height()
+        signature = (width, height, self._value, self._maximum)
+        if signature == getattr(self, "_draw_signature", None):
+            return
+        self._draw_signature = signature
         ratio = max(0, min(1, self._value / self._maximum)) if self._maximum > 0 else 0
         self.coords("track", 0, 0, width, height)
         self.coords("fill", 0, 0, width * ratio, height)
@@ -192,6 +196,71 @@ class ResourceBar(tk.Canvas):
         if key in ("value", "maximum"):
             return getattr(self, "_" + key)
         return super().__getitem__(key)
+
+
+class ScrollCanvas(tk.Canvas):
+    """Keep native child-window scrolling out of repeated layout/redraw work."""
+
+    def __init__(self, parent: tk.Misc, **kwargs: Any) -> None:
+        kwargs.setdefault("yscrollincrement", 1)
+        super().__init__(parent, **kwargs)
+        self._content_size: tuple[int, int] | None = None
+        self._content_width: int | None = None
+        self._wheel_pixels = 0.0
+        self._scroll_after: str | None = None
+        self.bind("<Destroy>", self._cancel_scroll, add="+")
+
+    def attach(self, content: tk.Misc, window: int) -> None:
+        def content_size(event: Any) -> None:
+            size = (event.width, event.height)
+            # Canvas scrolling also emits Configure when the frame moves.
+            # Only a size change requires a new scroll region.
+            if size != self._content_size:
+                self._content_size = size
+                self.configure(scrollregion=(0, 0, *size))
+
+        def viewport_size(event: Any) -> None:
+            if event.width != self._content_width:
+                self._content_width = event.width
+                self.itemconfigure(window, width=event.width)
+
+        content.bind("<Configure>", content_size, add="+")
+        self.bind("<Configure>", viewport_size, add="+")
+
+    def wheel(self, event: Any) -> str:
+        delta = getattr(event, "delta", 0)
+        number = getattr(event, "num", None)
+        notches = -1 if number == 4 else 1 if number == 5 else -delta / 120
+        if notches:
+            self._queue_pixels(notches * 48 * self.winfo_fpixels("1i") / 96)
+        return "break"
+
+    def scroll_view(self, *args: Any) -> None:
+        if len(args) == 3 and args[0] == "scroll" and args[2] == "units":
+            self._queue_pixels(int(args[1]) * 16 * self.winfo_fpixels("1i") / 96)
+        else:
+            self.yview(*args)
+
+    def _queue_pixels(self, pixels: float) -> None:
+        self._wheel_pixels += pixels
+        if self._scroll_after is None:
+            self._scroll_after = self.after(16, self._flush_scroll)
+
+    def _flush_scroll(self) -> None:
+        self._scroll_after = None
+        pixels, self._wheel_pixels = self._wheel_pixels, 0.0
+        if not self.winfo_ismapped() or not self._content_size:
+            return
+        height = self._content_size[1]
+        available = max(0, height - self.winfo_height())
+        if available:
+            position = max(0, min(available, self.canvasy(0) + pixels))
+            self.yview_moveto(position / height)
+
+    def _cancel_scroll(self, event: Any) -> None:
+        if event.widget == self and self._scroll_after is not None:
+            self.after_cancel(self._scroll_after)
+            self._scroll_after = None
 
 
 class RoundedPanel(tk.Frame):
@@ -485,6 +554,11 @@ class DesktopRuntimeManager:
         for item in self.store.data.get("experiments", []):
             visible.append({key: value for key, value in item.items() if key != "local_script"})
         return visible
+
+    def set_gpu_blocked(self, server_id: str, gpu_index: int, blocked: bool, gpu_uuid: str = "") -> None:
+        if not any(record.get("id") == server_id for record in self.store.data.get("servers", [])):
+            raise ValueError("服务器不存在")
+        self.runtime_for(server_id).set_gpu_blocked(gpu_index, blocked, gpu_uuid)
 
     def public_state(self) -> dict[str, Any]:
         self._sync_runtimes()
@@ -796,6 +870,7 @@ class DesktopClient(tk.Tk):
         self.selected_log = None
         self.queue_filter = "all"
         self.benchmark_running: set[tuple[str, int]] = set()
+        self.gpu_scheduling_pending: set[tuple[str, int]] = set()
         self.log_loading = False
         self.gpu_widgets: dict[int, dict[str, Any]] = {}
         self.gpu_topology: tuple[Any, ...] | None = None
@@ -977,6 +1052,33 @@ class DesktopClient(tk.Tk):
             style.configure(name, foreground=foreground, background=COLORS["surface"], padding=(14, 9), font=(FONT, 9, "bold" if variant == "primary" else "normal"), anchor="center")
             style.map(name, foreground=[("disabled", "#8e9cb0"), ("!disabled", foreground)])
 
+        # Compact status controls share the card header instead of adding an
+        # extra action row. Keep ordinary ttk button semantics and keyboard use.
+        for variant, normal, active, foreground, track, enabled in (
+            ("normal", "#eff8f5", "#e0f2eb", COLORS["green_dark"], COLORS["green"], True),
+            ("blocked", "#fff3f2", "#fbe7e5", "#b35c62", "#d89a9e", False),
+        ):
+            for state, fill, border in (("normal", normal, normal), ("active", active, active), ("focus", normal, foreground), ("disabled", "#f2f4f7", "#f2f4f7")):
+                images[f"policy.{variant}.{state}"] = self._field_image(fill, border, radius=15)
+            element = f"Policy.{variant}.button"
+            style.element_create(element, "image", images[f"policy.{variant}.normal"], ("disabled", images[f"policy.{variant}.disabled"]), ("pressed", images[f"policy.{variant}.active"]), ("active", images[f"policy.{variant}.active"]), ("focus", images[f"policy.{variant}.focus"]), border=15, sticky="nswe")
+            name = f"Policy.{variant}.TButton"
+            style.layout(name, [(element, {"sticky": "nswe", "children": [("Button.padding", {"sticky": "nswe", "children": [("Button.label", {"sticky": "nswe"})]})]})])
+            style.configure(name, foreground=foreground, background=COLORS["surface"], padding=(10, 3), font=(FONT, 8), anchor="center")
+            style.map(name, foreground=[("disabled", COLORS["muted"]), ("!disabled", foreground)])
+            scale = self.winfo_fpixels("1i") / 96
+            width, height = round(36 * scale), round(18 * scale)
+            image = tk.PhotoImage(master=self, width=width, height=height)
+            radius, center_y = 8 * scale, 9 * scale
+            center_x = (20 if enabled else 8) * scale
+            for y in range(height):
+                for x in range(round(28 * scale)):
+                    capsule_x = min(max(x + .5, radius), 28 * scale - radius)
+                    if (x + .5 - capsule_x) ** 2 + (y + .5 - center_y) ** 2 <= radius ** 2:
+                        color = "#ffffff" if (x + .5 - center_x) ** 2 + (y + .5 - center_y) ** 2 <= (5.5 * scale) ** 2 else track
+                        image.put(color, (x, y))
+            images[f"policy.{variant}.switch"] = image
+
     def _combobox(self, parent: tk.Misc, **kwargs: Any) -> ttk.Combobox:
         kwargs.setdefault("font", (FONT, 10))
         return ttk.Combobox(parent, **kwargs)
@@ -1106,6 +1208,26 @@ class DesktopClient(tk.Tk):
         ttk.Style(self).configure(name, background=button.master.cget("bg"))
         button.configure(style=name)
 
+    def _gpu_policy_button(self, parent: tk.Misc, server_id: str, gpu_index: int) -> ttk.Button:
+        button = ttk.Button(parent, text="正常", command=lambda: self.toggle_gpu_scheduling(server_id, gpu_index), style="Policy.normal.TButton", image=self.control_images["policy.normal.switch"], compound="left", cursor="hand2", takefocus=True, width=0)
+
+        def explain(_event: Any) -> None:
+            if self.status_var.get() == getattr(button, "policy_hint", None):
+                return
+            button.policy_previous_status = self.status_var.get()
+            button.policy_hint = "已屏蔽 · 继续监测，不参与调度；点击恢复正常" if button.cget("text") == "屏蔽" else "正常 · 参与任务调度；点击屏蔽此卡，监测继续保留"
+            self.status_var.set(button.policy_hint)
+
+        def clear_hint(_event: Any) -> None:
+            if self.status_var.get() == getattr(button, "policy_hint", None):
+                self.status_var.set(button.policy_previous_status)
+
+        button.bind("<Enter>", explain)
+        button.bind("<Leave>", clear_hint)
+        button.bind("<FocusIn>", explain)
+        button.bind("<FocusOut>", clear_hint)
+        return button
+
     def _dialog(self, title: str, kicker: str, description: str, parent: tk.Misc | None = None, size: tuple[int, int] = (760, 640), scroll: bool = False, card: bool = True, modal: bool = True) -> tuple[tk.Toplevel, tk.Frame, tk.Frame]:
         owner = parent or self
         dialog = tk.Toplevel(owner)
@@ -1146,20 +1268,19 @@ class DesktopClient(tk.Tk):
         shell = tk.Frame(dialog, bg=COLORS["bg"])
         shell.pack(fill="both", expand=True, padx=24, pady=20)
         if scroll:
-            canvas = tk.Canvas(shell, bg=COLORS["bg"], bd=0, highlightthickness=0)
-            scrollbar = ttk.Scrollbar(shell, orient="vertical", command=canvas.yview)
+            canvas = ScrollCanvas(shell, bg=COLORS["bg"], bd=0, highlightthickness=0)
+            scrollbar = ttk.Scrollbar(shell, orient="vertical", command=canvas.scroll_view)
             canvas.configure(yscrollcommand=scrollbar.set)
             canvas.pack(side="left", fill="both", expand=True)
             scrollbar.pack(side="right", fill="y", padx=(10, 0))
             content = self._card(canvas) if card else tk.Frame(canvas, bg=COLORS["bg"])
             window = canvas.create_window((0, 0), window=content, anchor="nw")
-            content.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
-            canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=event.width))
-            def wheel(event: Any) -> None:
-                if hasattr(event.widget, "winfo_class") and event.widget.winfo_class() in ("Listbox", "Text", "TCombobox"):
+            canvas.attach(content, window)
+            def wheel(event: Any) -> str | None:
+                if hasattr(event.widget, "winfo_class") and event.widget.winfo_class() in ("Listbox", "Text", "Treeview", "TCombobox", "TSpinbox"):
                     return
                 if content in self._widget_ancestors(event.widget) or event.widget == canvas:
-                    canvas.yview_scroll(-3 if getattr(event, "delta", 0) > 0 or getattr(event, "num", None) == 4 else 3, "units")
+                    return canvas.wheel(event)
             for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
                 dialog.bind(sequence, wheel, add="+")
         else:
@@ -1208,6 +1329,10 @@ class DesktopClient(tk.Tk):
         """Reposition existing cards without rebuilding their live widgets."""
         scale = self.winfo_fpixels("1i") / 96
         columns = max(1, min(limit, int(width / (minimum * scale))))
+        signature = (columns, limit, tuple(cards))
+        if signature == getattr(parent, "_card_layout", None):
+            return
+        parent._card_layout = signature
         for column in range(limit):
             parent.columnconfigure(column, weight=1 if column < columns else 0, minsize=0, uniform="cards" if column < columns else "")
         for index, card in enumerate(cards):
@@ -1232,15 +1357,14 @@ class DesktopClient(tk.Tk):
         view = self._new_view("dashboard")
         scroll_shell = tk.Frame(view, bg=COLORS["bg"])
         scroll_shell.pack(fill="both", expand=True)
-        self.dashboard_canvas = tk.Canvas(scroll_shell, bg=COLORS["bg"], highlightthickness=0, bd=0)
-        dashboard_scroll = ttk.Scrollbar(scroll_shell, orient="vertical", command=self.dashboard_canvas.yview)
+        self.dashboard_canvas = ScrollCanvas(scroll_shell, bg=COLORS["bg"], highlightthickness=0, bd=0)
+        dashboard_scroll = ttk.Scrollbar(scroll_shell, orient="vertical", command=self.dashboard_canvas.scroll_view)
         self.dashboard_canvas.configure(yscrollcommand=dashboard_scroll.set)
         self.dashboard_canvas.pack(side="left", fill="both", expand=True)
         dashboard_scroll.pack(side="right", fill="y")
         self.dashboard_scroll_frame = tk.Frame(self.dashboard_canvas, bg=COLORS["bg"])
         dashboard_window = self.dashboard_canvas.create_window((0, 0), window=self.dashboard_scroll_frame, anchor="nw")
-        self.dashboard_scroll_frame.bind("<Configure>", lambda _event: self.dashboard_canvas.configure(scrollregion=self.dashboard_canvas.bbox("all")))
-        self.dashboard_canvas.bind("<Configure>", lambda event: self.dashboard_canvas.itemconfigure(dashboard_window, width=event.width))
+        self.dashboard_canvas.attach(self.dashboard_scroll_frame, dashboard_window)
         self.bind_all("<MouseWheel>", self._scroll_dashboard)
         self.bind_all("<Button-4>", self._scroll_dashboard)
         self.bind_all("<Button-5>", self._scroll_dashboard)
@@ -1310,16 +1434,10 @@ class DesktopClient(tk.Tk):
         self.storage_body = tk.Frame(self.storage_card, bg=COLORS["surface"])
         self.storage_body.pack(fill="both", expand=True, padx=19, pady=(0, 14))
 
-    def _scroll_dashboard(self, event: Any) -> None:
+    def _scroll_dashboard(self, event: Any) -> str | None:
         if self.current_view != "dashboard" or self.views["dashboard"] not in self._widget_ancestors(event.widget):
             return
-        if getattr(event, "num", None) == 4:
-            delta = -3
-        elif getattr(event, "num", None) == 5:
-            delta = 3
-        else:
-            delta = -3 if getattr(event, "delta", 0) > 0 else 3
-        self.dashboard_canvas.yview_scroll(delta, "units")
+        return self.dashboard_canvas.wheel(event)
 
     def _build_queue(self) -> None:
         view = self._new_view("queue")
@@ -1398,15 +1516,14 @@ class DesktopClient(tk.Tk):
         view = self._new_view("benchmarks")
         scroll_shell = tk.Frame(view, bg=COLORS["bg"])
         scroll_shell.pack(fill="both", expand=True)
-        self.benchmark_canvas = tk.Canvas(scroll_shell, bg=COLORS["bg"], highlightthickness=0, bd=0)
-        benchmark_scroll = ttk.Scrollbar(scroll_shell, orient="vertical", command=self.benchmark_canvas.yview)
+        self.benchmark_canvas = ScrollCanvas(scroll_shell, bg=COLORS["bg"], highlightthickness=0, bd=0)
+        benchmark_scroll = ttk.Scrollbar(scroll_shell, orient="vertical", command=self.benchmark_canvas.scroll_view)
         self.benchmark_canvas.configure(yscrollcommand=benchmark_scroll.set)
         self.benchmark_canvas.pack(side="left", fill="both", expand=True)
         benchmark_scroll.pack(side="right", fill="y")
         self.benchmark_scroll_frame = tk.Frame(self.benchmark_canvas, bg=COLORS["bg"])
         benchmark_window = self.benchmark_canvas.create_window((0, 0), window=self.benchmark_scroll_frame, anchor="nw")
-        self.benchmark_scroll_frame.bind("<Configure>", lambda _event: self.benchmark_canvas.configure(scrollregion=self.benchmark_canvas.bbox("all")))
-        self.benchmark_canvas.bind("<Configure>", lambda event: self.benchmark_canvas.itemconfigure(benchmark_window, width=event.width))
+        self.benchmark_canvas.attach(self.benchmark_scroll_frame, benchmark_window)
         self.bind_all("<MouseWheel>", self._scroll_benchmark, add="+")
         self.bind_all("<Button-4>", self._scroll_benchmark, add="+")
         self.bind_all("<Button-5>", self._scroll_benchmark, add="+")
@@ -1442,16 +1559,12 @@ class DesktopClient(tk.Tk):
         history_horizontal.grid(row=1, column=0, sticky="ew")
         self.history_tree.configure(yscrollcommand=history_scroll.set, xscrollcommand=history_horizontal.set)
 
-    def _scroll_benchmark(self, event: Any) -> None:
+    def _scroll_benchmark(self, event: Any) -> str | None:
         if self.current_view != "benchmarks" or self.views["benchmarks"] not in self._widget_ancestors(event.widget):
             return
-        if getattr(event, "num", None) == 4:
-            delta = -3
-        elif getattr(event, "num", None) == 5:
-            delta = 3
-        else:
-            delta = -3 if getattr(event, "delta", 0) > 0 else 3
-        self.benchmark_canvas.yview_scroll(delta, "units")
+        if event.widget.winfo_class() in ("Treeview", "Text", "Listbox", "TCombobox", "TSpinbox"):
+            return
+        return self.benchmark_canvas.wheel(event)
 
     def _build_logs(self) -> None:
         view = self._new_view("logs")
@@ -1465,20 +1578,22 @@ class DesktopClient(tk.Tk):
         tk.Label(self.log_list_card, text="任务列表", bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 14, "bold")).pack(anchor="w", padx=15, pady=(4, 10))
         list_shell = tk.Frame(self.log_list_card, bg=COLORS["surface"])
         list_shell.pack(fill="both", expand=True, padx=8, pady=(0, 10))
-        self.log_list_canvas = tk.Canvas(list_shell, bg=COLORS["surface"], bd=0, highlightthickness=0, width=240)
-        list_scroll = ttk.Scrollbar(list_shell, orient="vertical", command=self.log_list_canvas.yview)
+        self.log_list_canvas = ScrollCanvas(list_shell, bg=COLORS["surface"], bd=0, highlightthickness=0, width=240)
+        list_scroll = ttk.Scrollbar(list_shell, orient="vertical", command=self.log_list_canvas.scroll_view)
         self.log_list_canvas.configure(yscrollcommand=list_scroll.set)
         self.log_list_canvas.pack(side="left", fill="both", expand=True)
         list_scroll.pack(side="right", fill="y")
         self.log_list_body = tk.Frame(self.log_list_canvas, bg=COLORS["surface"])
         list_window = self.log_list_canvas.create_window((0, 0), window=self.log_list_body, anchor="nw")
-        self.log_list_body.bind("<Configure>", lambda _event: self.log_list_canvas.configure(scrollregion=self.log_list_canvas.bbox("all")))
+        self.log_list_canvas.attach(self.log_list_body, list_window)
         def resize_list(event: Any) -> None:
-            self.log_list_canvas.itemconfigure(list_window, width=event.width)
+            if event.width == getattr(self.log_list_canvas, "_list_wrap_width", None):
+                return
+            self.log_list_canvas._list_wrap_width = event.width
             for button in self.log_list_body.winfo_children():
                 if button.winfo_class() == "Button":
                     button.configure(wraplength=max(1, event.width - 26))
-        self.log_list_canvas.bind("<Configure>", resize_list)
+        self.log_list_canvas.bind("<Configure>", resize_list, add="+")
         self.bind_all("<MouseWheel>", self._scroll_log_list, add="+")
         self.bind_all("<Button-4>", self._scroll_log_list, add="+")
         self.bind_all("<Button-5>", self._scroll_log_list, add="+")
@@ -1505,11 +1620,10 @@ class DesktopClient(tk.Tk):
         self.log_text.insert("1.0", "选择左侧实验查看最新日志。")
         self.log_text.configure(state="disabled")
 
-    def _scroll_log_list(self, event: Any) -> None:
+    def _scroll_log_list(self, event: Any) -> str | None:
         if self.current_view != "logs" or self.log_list_card not in self._widget_ancestors(event.widget):
             return
-        delta = -3 if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0 else 3
-        self.log_list_canvas.yview_scroll(delta, "units")
+        return self.log_list_canvas.wheel(event)
 
     def _widget_ancestors(self, widget: tk.Misc) -> list[tk.Misc]:
         ancestors = []
@@ -1885,7 +1999,9 @@ class DesktopClient(tk.Tk):
                 top.pack(fill="x", padx=17, pady=(16, 0))
                 tk.Label(top, text=f"GPU {gpu_index}", bg=COLORS["mint"], fg=COLORS["green_dark"], font=(MONO, 9, "bold"), padx=8, pady=5).pack(side="left")
                 temp_label = tk.Label(top, bg=COLORS["surface"], font=(MONO, 8))
-                temp_label.pack(side="right")
+                temp_label.pack(side="left", padx=(10, 0))
+                policy_button = self._gpu_policy_button(top, selected_server, gpu_index)
+                policy_button.pack(side="right")
                 name_label = tk.Label(card, bg=COLORS["surface"], fg=COLORS["ink"], font=(FONT, 10, "bold"), anchor="w", justify="left", width=1)
                 name_label.pack(fill="x", padx=17, pady=(10, 0))
                 card.bind("<Configure>", lambda event, label=name_label: label.configure(wraplength=max(1, event.width - 36)))
@@ -1914,6 +2030,7 @@ class DesktopClient(tk.Tk):
                     "utilization_label": utilization_label,
                     "state": state_label,
                     "speed": speed_label,
+                    "policy_button": policy_button,
                 }
                 self._bind_gpu_detail(card, selected_server, gpu_index)
 
@@ -1926,6 +2043,10 @@ class DesktopClient(tk.Tk):
             widget = state["widgets"].get(gpu_index)
             if not widget:
                 continue
+            signature = tuple(gpu.get(key) for key in ("name", "uuid", "temperature_c", "memory_used_mb", "memory_total_mb", "utilization_gpu", "scheduler_idle", "reserved_mb", "process_count", "scheduling_blocked")) + ((gpu.get("benchmark") or {}).get("tensor_tflops"), (selected_server, gpu_index) in self.gpu_scheduling_pending)
+            if signature == widget.get("display_signature"):
+                continue
+            widget["display_signature"] = signature
             temp = gpu.get("temperature_c", "—")
             try:
                 hot = float(temp) > 80
@@ -1942,10 +2063,54 @@ class DesktopClient(tk.Tk):
             widget["utilization_label"].configure(text=f"{utilization:.1f}%")
             idle = bool(gpu.get("scheduler_idle")) and not gpu.get("reserved_mb")
             state_text = "空闲可调度" if idle else ("队列已占用" if gpu.get("reserved_mb") else f"{gpu.get('process_count', 0)} 个进程")
-            widget["state"].configure(text=f"● {state_text}", fg=COLORS["green_dark"] if idle else COLORS["amber"])
+            if gpu.get("scheduling_blocked"):
+                state_text = "已屏蔽 · 继续监测"
+            widget["state"].configure(text=f"● {state_text}", fg=COLORS["red"] if gpu.get("scheduling_blocked") else COLORS["green_dark"] if idle else COLORS["amber"])
+            self._update_gpu_policy_button(widget["policy_button"], selected_server, gpu)
             bench = gpu.get("benchmark") or {}
             speed = f"{float(bench.get('tensor_tflops')):.2f} TFLOPS" if bench.get("tensor_tflops") else "未测试"
             widget["speed"].configure(text=speed)
+
+    def _update_gpu_policy_button(self, button: ttk.Button, server_id: str, gpu: dict[str, Any]) -> None:
+        blocked = bool(gpu.get("scheduling_blocked"))
+        pending = (server_id, safe_int(gpu.get("index"), -1)) in self.gpu_scheduling_pending
+        signature = (blocked, pending)
+        if signature == getattr(button, "_policy_display", None):
+            return
+        button._policy_display = signature
+        variant = "blocked" if blocked else "normal"
+        button.configure(text="保存中…" if pending else "屏蔽" if blocked else "正常", state="disabled" if pending else "normal", style=f"Policy.{variant}.TButton", image="" if pending else self.control_images[f"policy.{variant}.switch"])
+
+    def toggle_gpu_scheduling(self, server_id: str, gpu_index: int) -> None:
+        key = (server_id, gpu_index)
+        if key in self.gpu_scheduling_pending:
+            return
+        gpu = next((item for item in ((self.state.get("server_states", {}).get(server_id) or {}).get("snapshot") or {}).get("gpus", []) if safe_int(item.get("index"), -1) == gpu_index), None)
+        if gpu is None:
+            self.set_status("暂无该显卡数据，请刷新后重试", True)
+            return
+        blocked = not bool(gpu.get("scheduling_blocked"))
+        gpu_uuid = str(gpu.get("uuid") or "")
+        self.gpu_scheduling_pending.add(key)
+        self.refresh_state()
+
+        def finish(error: str = "") -> None:
+            self.gpu_scheduling_pending.discard(key)
+            self.refresh_state()
+            self.set_status(error or f"GPU {gpu_index} 已{'屏蔽：继续监测，不再分配新任务' if blocked else '恢复正常调度'}", bool(error))
+
+        def worker() -> None:
+            error = ""
+            try:
+                self.manager.set_gpu_blocked(server_id, gpu_index, blocked, gpu_uuid)
+            except Exception as exc:
+                error = f"GPU 状态保存失败：{exc}"
+            try:
+                self.after(0, lambda: finish(error))
+            except (tk.TclError, RuntimeError):
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def show_gpu_detail(self, server_id: str, gpu_index: int) -> tk.Toplevel:
         dialogs = self.__dict__.setdefault("gpu_detail_dialogs", {})
@@ -2010,22 +2175,18 @@ class DesktopClient(tk.Tk):
         tk.Label(toolbar, text="每 2 秒自动更新 · 按显存排序", bg=toolbar.cget("bg"), fg=COLORS["muted"], font=(FONT, 8)).pack(side="right")
         process_frame = tk.Frame(content, bg=content.cget("bg"))
         process_frame.pack(fill="both", expand=True)
-        canvas = tk.Canvas(process_frame, bg=content.cget("bg"), bd=0, highlightthickness=0, yscrollincrement=24)
-        scrollbar = ttk.Scrollbar(process_frame, orient="vertical", command=canvas.yview)
+        canvas = ScrollCanvas(process_frame, bg=content.cget("bg"), bd=0, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(process_frame, orient="vertical", command=canvas.scroll_view)
         scrollbar.pack(side="right", fill="y", padx=(10, 0))
         canvas.pack(side="left", fill="both", expand=True)
         canvas.configure(yscrollcommand=scrollbar.set)
         process_list = tk.Frame(canvas, bg=content.cget("bg"))
         window = canvas.create_window(0, 0, anchor="nw", window=process_list)
-        process_list.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=event.width))
+        canvas.attach(process_list, window)
 
         def wheel(event: Any) -> str | None:
             if process_list in self._widget_ancestors(event.widget) or event.widget == canvas:
-                region = canvas.bbox("all")
-                if region and region[3] > canvas.winfo_height():
-                    canvas.yview_scroll(-3 if getattr(event, "delta", 0) > 0 or getattr(event, "num", None) == 4 else 3, "units")
-                return "break"
+                return canvas.wheel(event)
             return None
 
         for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
@@ -2078,6 +2239,8 @@ class DesktopClient(tk.Tk):
                 summary_labels[1].configure(text=f"进程显存合计 {fmt_mb(sum(safe_int(item.get('memory_mb'), 0) for item in processes))}")
                 idle = bool(gpu.get("scheduler_idle")) and not gpu.get("reserved_mb")
                 status = "空闲可调度" if idle else "队列已占用" if gpu.get("reserved_mb") else f"{gpu.get('process_count', len(processes))} 个进程运行中"
+                if gpu.get("scheduling_blocked"):
+                    status = "已屏蔽 · 不参与调度"
                 temperature = gpu.get("temperature_c")
                 summary_labels[2].configure(text=f"{temperature if temperature is not None else '—'}°C · {status}")
                 memory_var.set(f"显存 {percent:.1f}% · {free:,} MB 可用 / {total:,} MB")
@@ -2422,7 +2585,9 @@ class DesktopClient(tk.Tk):
                     card.bind("<Configure>", lambda event, label=title_label: label.configure(wraplength=max(1, event.width - 36)))
                     title_label.bind("<Button-1>", detail_command)
                     temp_label = tk.Label(top, text="—°C", bg=COLORS["surface"], fg="#6b7b92", font=(MONO, 8))
-                    temp_label.pack(side="right")
+                    temp_label.pack(side="left", padx=(10, 0))
+                    policy_button = self._gpu_policy_button(top, server_id, gpu_index)
+                    policy_button.pack(side="right")
                     memory_label = tk.Label(card, text="显存 —", bg=COLORS["surface"], fg="#6b7b92", font=(MONO, 8), anchor="w")
                     memory_label.pack(fill="x", padx=17, pady=(8, 0))
                     score = tk.Frame(card, bg=COLORS["surface"])
@@ -2450,6 +2615,7 @@ class DesktopClient(tk.Tk):
                         "tensor": score_labels["Tensor FP16"],
                         "fp32": score_labels["FP32"],
                         "button": button,
+                        "policy_button": policy_button,
                     }
                 grid.bind("<Configure>", lambda event, parent=grid, widgets=cards: self._reflow_cards(parent, widgets, event.width, 290, 3))
                 self._reflow_cards(grid, cards, grid.winfo_width(), 290, 3)
@@ -2460,6 +2626,11 @@ class DesktopClient(tk.Tk):
                 widget = self.benchmark_widgets.get((server_id, gpu_index))
                 if not widget:
                     continue
+                bench = gpu.get("benchmark") or {}
+                signature = tuple(gpu.get(key) for key in ("temperature_c", "memory_total_mb", "memory_used_mb", "scheduling_blocked")) + (bench.get("tensor_tflops"), bench.get("fp32_tflops"), (server_id, gpu_index) in self.benchmark_running, (server_id, gpu_index) in self.gpu_scheduling_pending)
+                if signature == widget.get("display_signature"):
+                    continue
+                widget["display_signature"] = signature
                 temp = gpu.get("temperature_c", "—")
                 try:
                     hot = float(temp) > 80
@@ -2474,6 +2645,7 @@ class DesktopClient(tk.Tk):
                 widget["tensor"].configure(text=f"{float(bench.get('tensor_tflops')):.2f} TFLOPS" if bench.get("tensor_tflops") else "— TFLOPS")
                 widget["fp32"].configure(text=f"{float(bench.get('fp32_tflops')):.2f} TFLOPS" if bench.get("fp32_tflops") else "— TFLOPS")
                 widget["button"].configure(text="测试中…" if (server_id, gpu_index) in self.benchmark_running else "运行测试 ϟ")
+                self._update_gpu_policy_button(widget["policy_button"], server_id, gpu)
         self.render_history()
 
     def render_history(self) -> None:

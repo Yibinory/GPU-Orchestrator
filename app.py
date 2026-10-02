@@ -646,6 +646,35 @@ PY
     def _gpu_history_key(self, gpu: dict[str, Any]) -> str:
         return str(gpu.get("uuid") or f"index:{safe_int(gpu.get('index'), -1)}")
 
+    def _gpu_blocked(self, gpu: dict[str, Any]) -> bool:
+        with self.store.lock:
+            return self._gpu_history_key(gpu) in self._server_record().get("blocked_gpu_keys", [])
+
+    def set_gpu_blocked(self, gpu_index: int, blocked: bool, gpu_uuid: str = "") -> None:
+        """Persist scheduling policy without waiting for an SSH poll or stopping tasks."""
+        if type(gpu_index) is not int or gpu_index < 0 or type(blocked) is not bool:
+            raise ValueError("GPU 编号必须为非负整数，屏蔽状态必须为布尔值")
+        with self.store.lock:
+            gpu = next((item for item in (self.snapshot or {}).get("gpus", []) if safe_int(item.get("index"), -1) == gpu_index), None)
+            if gpu is None:
+                raise ValueError("显卡不存在或尚无监测数据")
+            if gpu_uuid and str(gpu.get("uuid") or "") != gpu_uuid:
+                raise ValueError("显卡标识已变化，请刷新后重试")
+            record = self._server_record()
+            keys = set(record.get("blocked_gpu_keys", []))
+            key = self._gpu_history_key(gpu)
+            if blocked:
+                keys.add(key)
+            else:
+                keys.discard(key)
+            previous = record.get("blocked_gpu_keys", [])
+            record["blocked_gpu_keys"] = sorted(keys)
+            try:
+                self.store.save()
+            except Exception:
+                record["blocked_gpu_keys"] = previous
+                raise
+
     def _history_sample_count(self) -> int:
         with self.store.lock:
             settings = self.store.data.setdefault("global_settings", {})
@@ -699,6 +728,7 @@ PY
             gpu["benchmark"] = bench
             gpu["reserved_mb"] = 0
             gpu["scheduler_idle"] = bool(gpu.get("is_idle"))
+            gpu["scheduling_blocked"] = self._gpu_blocked(gpu)
         for exp in self._server_experiments():
             if exp.get("status") in ("running", "paused") and exp.get("assigned_gpu"):
                 idx = safe_int((exp.get("assigned_gpu") or {}).get("index"), -1)
@@ -792,6 +822,10 @@ PY
         max_utilization = max(0, min(100, safe_float(exp.get("max_gpu_utilization"), 30)))
         eligible = []
         for gpu in self.snapshot.get("gpus", []):
+            # Consult saved policy on every choice, including stale snapshots
+            # and emergency jobs; restoring a card takes effect immediately.
+            if self._gpu_blocked(gpu):
+                continue
             idle = bool(gpu.get("scheduler_idle", gpu.get("is_idle")))
             free_mb = safe_int(gpu.get("scheduler_free_mb", gpu.get("memory_free_mb")), 0)
             baseline = None
@@ -825,7 +859,10 @@ PY
             return f"conda run --no-capture-output -n {q(env)}"
         return f". {q(profile)} >/dev/null 2>&1 && conda run --no-capture-output -n {q(env)}"
 
-    def _start(self, exp: dict[str, Any], gpu: dict[str, Any]) -> None:
+    def _start(self, exp: dict[str, Any], gpu: dict[str, Any]) -> bool | None:
+        # A card may have been blocked after selection but before dispatch.
+        if self._gpu_blocked(gpu):
+            return False
         exp_id = exp["id"]
         run_dir = f"{self.remote_root}/runs/{exp_id}"
         script_path = f"{run_dir}/run.sh"
@@ -856,6 +893,10 @@ PY
         # attempt's exit marker before starting, otherwise the next poll could
         # mistake an old exit code for the new process.
         self.remote.exec(f"rm -f {q(exit_path)}")
+        # Upload/setup can take time. Honour a mask applied during that work
+        # before issuing the command that actually starts the experiment.
+        if self._gpu_blocked(gpu):
+            return False
         result = self.remote.exec(f"nohup setsid bash -lc {q(inner)} >/dev/null 2>&1 & echo $!", timeout=15)
         pid_lines = [line.strip() for line in result["stdout"].splitlines() if line.strip()]
         pid = safe_int(pid_lines[-1] if pid_lines else 0, 0)
@@ -1063,7 +1104,8 @@ PY
             if not gpu:
                 continue
             try:
-                self._start(exp, gpu)
+                if self._start(exp, gpu) is False:
+                    continue
                 gpu["scheduler_idle"] = False
                 gpu["reserved_mb"] = safe_int(gpu.get("reserved_mb"), 0) + max(0, safe_int(exp.get("peak_memory_mb"), 0))
                 gpu["scheduler_free_mb"] = max(0, safe_int(gpu.get("memory_free_mb"), 0) - safe_int(gpu.get("reserved_mb"), 0))
@@ -2203,6 +2245,21 @@ def api_preferences():
                     del history[:-count]
         store.save()
     return jsonify(manager.public_state())
+
+
+@app.route("/api/gpus/scheduling", methods=["POST"])
+def api_gpu_scheduling():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "请求格式错误"}), 400
+    server_id = str(payload.get("server_id") or manager.active_server_id)
+    if not any(record.get("id") == server_id for record in manager.store.data.get("servers", [])):
+        return jsonify({"error": "服务器不存在"}), 404
+    try:
+        manager.runtime_for(server_id).set_gpu_blocked(payload.get("gpu_index"), payload.get("blocked"), str(payload.get("gpu_uuid") or ""))
+        return jsonify(manager.public_state())
+    except (ValueError, OSError) as exc:
+        return jsonify({"error": str(exc)}), 400
 
 
 def _auto_connect_worker() -> None:

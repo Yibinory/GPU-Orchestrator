@@ -108,9 +108,10 @@ button { cursor: pointer; }
 .live-pill i { width: 6px; height: 6px; box-shadow: none; }
 .gpu-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
 .gpu-card { position: relative; padding: 20px; min-height: 233px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); }
-.gpu-card-top { display: flex; align-items: flex-start; justify-content: space-between; }
+.gpu-card-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 13px; }
+.gpu-card-identity { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .gpu-index { display: inline-grid; place-items: center; min-width: 33px; height: 33px; padding: 0 10px; white-space: nowrap; border-radius: 9px; background: var(--mint); color: var(--green-dark); font: 700 12px 'DM Mono', monospace; }
-.gpu-name { max-width: calc(100% - 45px); margin: 1px 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 800; }
+.gpu-name { margin: 1px 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 800; }
 .gpu-id { margin-top: 5px; color: #99a49f; font: 9px 'DM Mono', monospace; }
 .gpu-temp { color: #8c9893; font: 10px 'DM Mono', monospace; }
 .gpu-temp.hot { color: var(--red); }
@@ -129,6 +130,20 @@ button { cursor: pointer; }
 .gpu-status.busy i { background: var(--amber); }
 .gpu-test-mini { border: 0; padding: 0; background: transparent; color: var(--green-dark); font-size: 10px; font-weight: 700; }
 .gpu-test-mini:hover { color: var(--green); }
+.gpu-scheduling-toggle { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 7px; min-width: 83px; min-height: 31px; border: 1px solid transparent; border-radius: 999px; padding: 6px 10px; background: #eff8f3; color: var(--green-dark); font-size: 10px; font-weight: 600; line-height: 1.4; white-space: nowrap; transition: background .18s, border-color .18s; }
+.gpu-scheduling-track { display: inline-flex; align-items: center; width: 26px; height: 15px; padding: 2px; border-radius: 999px; background: var(--green); }
+.gpu-scheduling-track i { display: block; width: 11px; height: 11px; border-radius: 50%; background: #fff; transform: translateX(11px); box-shadow: 0 1px 2px rgba(0,0,0,.12); transition: transform .18s; }
+.gpu-scheduling-toggle.blocked { background: #fff3f2; color: #ad5a5f; }
+.gpu-scheduling-toggle.blocked .gpu-scheduling-track { background: #d69b9d; }
+.gpu-scheduling-toggle.blocked .gpu-scheduling-track i { transform: translateX(0); }
+.gpu-scheduling-toggle:hover { background: #e0f2e8; border-color: #cbe6d8; }
+.gpu-scheduling-toggle.blocked:hover { background: #fbe7e5; border-color: #edcecc; }
+.gpu-scheduling-toggle:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
+.gpu-scheduling-toggle:disabled { color: #85928c; background: #f2f5f3; cursor: wait; }
+.gpu-scheduling-toggle.pending .gpu-scheduling-track { display: none; }
+.gpu-scheduling-toggle.pending::before { content: ''; width: 12px; height: 12px; border: 1.5px solid #cedbd4; border-top-color: var(--green); border-radius: 50%; animation: policy-saving .8s linear infinite; }
+@keyframes policy-saving { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .gpu-scheduling-toggle, .gpu-scheduling-track i { transition: none; } .gpu-scheduling-toggle.pending::before { animation: none; } }
 .empty-state { min-height: 160px; display: grid; place-items: center; padding: 28px; border: 1px dashed #d7e2dc; border-radius: 10px; color: #99a7a1; font-size: 12px; text-align: center; }
 .empty-state.compact { min-height: 100px; border: 0; }
 .dashboard-lower { display: grid; grid-template-columns: 1.35fr 1fr; gap: 14px; margin-top: 14px; }
@@ -257,7 +272,8 @@ tr:hover td { background: #fbfdfc; }
 .notice-card p { margin: 1px 0 0; color: #6f8d80; font-size: 11px; line-height: 1.6; }
 .benchmark-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 14px; }
 .benchmark-card { padding: 20px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); }
-.benchmark-card .gpu-card-top { margin-bottom: 21px; }
+.benchmark-card .gpu-card-top { margin-bottom: 13px; }
+.benchmark-card .gpu-id { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: 18px; }
 .benchmark-score { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .score-box { padding: 12px 13px; border-radius: 8px; background: var(--surface-soft); }
 .score-box span { display: block; color: #899790; font-size: 10px; }

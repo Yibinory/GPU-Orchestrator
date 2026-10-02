@@ -48,6 +48,10 @@ GPU 详情使用与 Web 端类似的进程卡片，按显存占用排序，显�
 
 详情窗口使用字体宽度与缓存计算命令换行高度，避免同步计算全部显示行阻塞界面；进程较多时分批创建卡片。重复点击同一 GPU 会复用已打开的窗口，关闭后取消刷新与待执行的布局任务。
 
+客户端和 Web 端的资源卡片、GPU 测试卡片均有独立的「正常 / 屏蔽」按钮，点击即可切换。正常卡继续参与任务调度；屏蔽卡继续监测显存、利用率、温度和进程，但默认、低干扰、紧急三种调度级别均不会分配新任务到该卡。屏蔽不会终止或暂停已经运行的任务，手动 GPU 测试仍可使用。
+
+设置保存在 `data/state.json` 的各服务器配置中，优先以 GPU UUID 标识显卡；没有 UUID 时按索引保存。重启、重新连接后仍生效，不同服务器的同号显卡互不影响。切换状态不等待 SSH 轮询，保存失败会显示错误并保留原状态。
+
 验证客户端布局（使用临时目录和演示数据，不连接 SSH，不修改现有配置）：
 
     python scripts/verify_desktop_ui.py
@@ -55,6 +59,15 @@ GPU 详情使用与 Web 端类似的进程卡片，按显存占用排序，显�
 检查 GPU 详情响应速度（长命令、窄窗口、多进程和重复点击）：
 
     python scripts/verify_gpu_detail_performance.py
+
+检查客户端滚动响应（24 张 GPU、连续滚轮与小幅输入、滚动位置、实时刷新和关闭清理）：
+
+    python scripts/verify_desktop_scroll_performance.py
+
+验证 GPU 屏蔽、持久化、多服务器隔离、调度和 Web 按钮交互：
+
+    python scripts/verify_gpu_scheduling.py
+    node scripts/verify_web_gpu_scheduling.js
 
 独立打开演示界面进行预览：
 

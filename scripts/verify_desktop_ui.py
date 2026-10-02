@@ -109,6 +109,10 @@ def run() -> None:
                             for widget in panel["gpu_state"]["widgets"].values():
                                 card = widget["card"]
                                 assert card.winfo_x() + card.winfo_width() <= parent.winfo_width(), "GPU card clipped"
+                                policy = widget["policy_button"]
+                                assert policy.master == widget["temp"].master, "Policy control left the card header"
+                                assert widget["temp"].winfo_x() + widget["temp"].winfo_width() <= policy.winfo_x(), "GPU header controls overlap"
+                                assert policy.winfo_x() + policy.winfo_width() <= policy.master.winfo_width(), "GPU policy control clipped"
             client._show_view("dashboard")
             client.update()
             assert client.sidebar_logo_image.width() >= 60, "Brand logo too small"
@@ -126,6 +130,52 @@ def run() -> None:
             client.geometry("1600x960")
             client.update()
             assert live_cards == client.dashboard_server_panels["default"]["gpu_state"]["widgets"], "Resize rebuilt live GPU widgets"
+            # Exercise real asynchronous toggle handlers against a synthetic
+            # persistence sink, including failure recovery and both card views.
+            updates = []
+            def wait_for_policy() -> None:
+                timeout = client.after(2000, client.quit)
+                def check() -> None:
+                    if client.gpu_scheduling_pending:
+                        client.after(20, check)
+                    else:
+                        client.after_cancel(timeout)
+                        client.quit()
+                client.after(20, check)
+                client.mainloop()
+                client.update()
+            original_policy = client.manager.set_gpu_blocked
+            def capture_policy(server_id, gpu_index, blocked, gpu_uuid):
+                updates.append((server_id, gpu_index, blocked, gpu_uuid))
+                next(gpu for gpu in data["server_states"][server_id]["snapshot"]["gpus"] if gpu["index"] == gpu_index)["scheduling_blocked"] = blocked
+            client.manager.set_gpu_blocked = capture_policy
+            button = live_cards[0]["policy_button"]
+            assert button.cget("text") == "正常" and not button.bind("<Button-1>"), "Policy button opens details"
+            button.invoke()
+            assert button.cget("text") == "保存中…" and str(button.cget("state")) == "disabled"
+            wait_for_policy()
+            assert updates == [("default", 0, True, "GPU-demo-0000")]
+            assert button.cget("text") == "屏蔽" and not client.gpu_scheduling_pending, (button.cget("text"), client.gpu_scheduling_pending, errors)
+            assert client.dashboard_server_panels["second"]["gpu_state"]["widgets"][0]["policy_button"].cget("text") == "正常", "Toggle leaked to another server"
+            assert not any(w.winfo_class() == "Toplevel" for w in client.winfo_children())
+            client._show_view("benchmarks")
+            client.update()
+            bench_button = client.benchmark_widgets[("default", 0)]["policy_button"]
+            assert bench_button.cget("text") == "屏蔽"
+            bench_button.invoke()
+            wait_for_policy()
+            assert updates[-1] == ("default", 0, False, "GPU-demo-0000") and bench_button.cget("text") == "正常"
+            client._show_view("dashboard")
+            client.update()
+            assert button.cget("text") == "正常"
+            def fail_policy(*_args):
+                raise OSError("Synthetic policy save failure")
+            client.manager.set_gpu_blocked = fail_policy
+            button.invoke()
+            wait_for_policy()
+            assert not client.gpu_scheduling_pending and button.cget("text") == "正常"
+            assert "Synthetic policy save failure" in client.status_var.get()
+            client.manager.set_gpu_blocked = original_policy
             for action in (client.open_server_manager, client.open_experiment_dialog, lambda: client.open_connection_dialog(new_server=True), lambda: client.open_disk_alert_dialog("default"), lambda: client.show_gpu_detail("default", 0)):
                 action()
                 client.update()
@@ -272,6 +322,7 @@ def run() -> None:
             client.open_full_log()
             client.after(250, client.quit)
             client.mainloop()
+            client.update()
             client.manager.runtime_for = runtime_for
             for dialog in [w for w in client.winfo_children() if w.winfo_class() == "Toplevel"]:
                 assert dialog.ui_footer.winfo_ismapped(), "Full log missing footer"

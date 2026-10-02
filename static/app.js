@@ -9,7 +9,8 @@ const UI = {
   editingExperimentId: null,
   editingServerId: null,
   sshHosts: [],
-  openProcesses: null
+  openProcesses: null,
+  gpuSchedulingPending: new Set()
 };
 
 const statusLabels = {
@@ -239,6 +240,41 @@ function renderMetrics() {
   $('#storage-donut').style.setProperty('--percent', diskPercent + '%');
 }
 
+function gpuSchedulingControl(gpu, serverId) {
+  const blocked = Boolean(gpu.scheduling_blocked);
+  const key = serverId + ':' + gpu.index;
+  const pending = UI.gpuSchedulingPending.has(key);
+  const hint = blocked ? '已屏蔽 · 继续监测，不参与调度；点击恢复正常' : '正常 · 参与任务调度；点击屏蔽此卡，监测继续保留';
+  return '<button type="button" class="gpu-scheduling-toggle ' + (blocked ? 'blocked' : 'normal') + (pending ? ' pending' : '') + '" data-gpu-scheduling="' + esc(gpu.index) + '" data-server-id="' + esc(serverId) + '" data-gpu-uuid="' + esc(gpu.uuid || '') + '" data-blocked="' + blocked + '" aria-pressed="' + blocked + '" aria-busy="' + pending + '" aria-label="GPU ' + esc(gpu.index) + '：' + hint + '" title="' + hint + '"' + (pending ? ' disabled' : '') + '><span class="gpu-scheduling-track" aria-hidden="true"><i></i></span><span class="gpu-scheduling-label">' + (pending ? '保存中…' : blocked ? '屏蔽' : '正常') + '</span></button>';
+}
+
+async function toggleGpuScheduling(button) {
+  const serverId = button.dataset.serverId;
+  const gpuIndex = Number(button.dataset.gpuScheduling);
+  const key = serverId + ':' + gpuIndex;
+  if (UI.gpuSchedulingPending.has(key)) return;
+  const blocked = button.dataset.blocked !== 'true';
+  UI.gpuSchedulingPending.add(key);
+  button.disabled = true;
+  button.classList.add('pending');
+  button.setAttribute('aria-busy', 'true');
+  button.querySelector('.gpu-scheduling-label').textContent = '保存中…';
+  try {
+    UI.data = await postJson('/api/gpus/scheduling', { server_id: serverId, gpu_index: gpuIndex, gpu_uuid: button.dataset.gpuUuid || '', blocked: blocked });
+    showToast('GPU ' + gpuIndex + (blocked ? ' 已屏蔽：继续监测，不再分配新任务' : ' 已恢复正常调度'));
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    UI.gpuSchedulingPending.delete(key);
+    renderAll();
+  }
+}
+
+document.addEventListener('click', function (event) {
+  const button = event.target.closest('[data-gpu-scheduling]');
+  if (button) toggleGpuScheduling(button);
+});
+
 function renderGpuFleet() {
   const gpus = (activeState() && activeState().snapshot && activeState().snapshot.gpus) || [];
   const root = $('#gpu-grid');
@@ -250,15 +286,15 @@ function renderGpuFleet() {
     const memoryPercent = gpu.memory_total_mb ? gpu.memory_used_mb / gpu.memory_total_mb * 100 : 0;
     const utilization = Number(gpu.utilization_gpu || 0);
     const benchmark = gpu.benchmark || {};
-    const idle = gpu.scheduler_idle && !gpu.reserved_mb;
+    const idle = gpu.scheduler_idle && !gpu.reserved_mb && !gpu.scheduling_blocked;
     const tempClass = Number(gpu.temperature_c || 0) > 80 ? 'hot' : '';
     const speed = benchmark.tensor_tflops ? Number(benchmark.tensor_tflops).toFixed(2) + ' TFLOPS' : '未测试';
     const processCount = Number(gpu.process_count || 0);
     const statusHtml = processCount > 0
       ? '<button class="gpu-status busy status-button" data-processes="' + esc(gpu.index) + '" title="查看进程详情"><i></i>' + processCount + ' 个进程</button>'
-      : '<span class="gpu-status ' + (idle ? 'idle' : 'busy') + '"><i></i>' + (idle ? '空闲可调度' : (gpu.reserved_mb ? '队列已占用' : '0 个进程')) + '</span>';
+      : '<span class="gpu-status ' + (idle ? 'idle' : 'busy') + '"><i></i>' + (gpu.scheduling_blocked ? '已屏蔽 · 继续监测' : idle ? '空闲可调度' : (gpu.reserved_mb ? '队列已占用' : '0 个进程')) + '</span>';
     return '<article class="gpu-card">' +
-      '<div class="gpu-card-top"><div><div class="gpu-index">GPU ' + esc(gpu.index) + '</div></div><div class="gpu-temp ' + tempClass + '">' + esc(gpu.temperature_c == null ? '—' : gpu.temperature_c) + '°C</div></div>' +
+      '<div class="gpu-card-top"><div class="gpu-card-identity"><div class="gpu-index">GPU ' + esc(gpu.index) + '</div><div class="gpu-temp ' + tempClass + '">' + esc(gpu.temperature_c == null ? '—' : gpu.temperature_c) + '°C</div></div>' + gpuSchedulingControl(gpu, UI.data.active_server_id) + '</div>' +
       '<div class="gpu-name" title="' + esc(gpu.name) + '">' + esc(gpu.name || 'Unknown GPU') + '</div>' +
       '<div class="gpu-id">' + esc((gpu.uuid || '').replace('GPU-', '').slice(0, 20)) + '</div>' +
       '<div class="gpu-meters"><div class="meter-row"><span>显存</span><div class="meter-track"><div class="meter-fill memory" style="width:' + pct(memoryPercent) + '"></div></div><span class="meter-number">' + memoryPercent.toFixed(1) + '%</span></div>' +
@@ -411,7 +447,7 @@ function renderBenchmarks() {
     const options = envs.map(function (env) {
       return '<option value="' + esc(env) + '"' + (env === defaultEnv ? ' selected' : '') + '>' + esc(env) + '</option>';
     }).join('');
-    return '<article class="benchmark-card"><div class="gpu-card-top"><div><div class="gpu-name">GPU ' + esc(gpu.index) + ' · ' + esc(gpu.name) + '</div><div class="gpu-id">' + fmtMb(gpu.memory_total_mb) + ' 显存 · ' + esc(gpu.uuid || '') + '</div></div><div class="gpu-temp">' + esc(gpu.temperature_c == null ? '—' : gpu.temperature_c) + '°C</div></div>' +
+    return '<article class="benchmark-card"><div class="gpu-card-top"><div class="gpu-card-identity"><div class="gpu-index">GPU ' + esc(gpu.index) + '</div><div class="gpu-temp">' + esc(gpu.temperature_c == null ? '—' : gpu.temperature_c) + '°C</div></div>' + gpuSchedulingControl(gpu, UI.data.active_server_id) + '</div><div class="gpu-name" title="' + esc(gpu.name) + '">' + esc(gpu.name) + '</div><div class="gpu-id">' + fmtMb(gpu.memory_total_mb) + ' 显存 · ' + esc(gpu.uuid || '') + '</div>' +
       '<div class="benchmark-score"><div class="score-box"><span>Tensor FP16</span><strong>' + (benchmark.tensor_tflops ? Number(benchmark.tensor_tflops).toFixed(2) : '—') + '<small> TFLOPS</small></strong></div><div class="score-box"><span>FP32</span><strong>' + (benchmark.fp32_tflops ? Number(benchmark.fp32_tflops).toFixed(2) : '—') + '<small> TFLOPS</small></strong></div></div>' +
       '<div class="benchmark-actions"><select class="benchmark-env" data-bench-env="' + esc(gpu.index) + '"><option value="">默认 Python</option>' + options + '</select><button class="test-button" data-benchmark="' + esc(gpu.index) + '">运行测试 ϟ</button></div></article>';
   }).join('');
@@ -742,6 +778,7 @@ function renderProcessModal(force) {
     '<span class="process-chip">' + processes.length + ' 个进程</span>' +
     '<span class="process-chip memory">显存占用合计 ' + esc(fmtMb(totalMb)) + '</span>' +
     '<span class="process-chip">利用率 ' + Number(gpu.utilization_gpu || 0).toFixed(1) + '%</span>';
+  if (gpu.scheduling_blocked) $('#process-summary').innerHTML += '<span class="process-chip">已屏蔽 · 继续监测</span>';
   const root = $('#process-list');
   const prevScroll = root.scrollTop;
   if (!processes.length) {
